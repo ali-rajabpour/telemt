@@ -21,3 +21,6 @@ target
 #.idea/
 
 proxy-secret
+
+# Environment variables (contains secrets)
+.env

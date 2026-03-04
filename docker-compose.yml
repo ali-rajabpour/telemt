@@ -2,11 +2,18 @@
 # Telemt — Docker Compose for Dokploy + Traefik TCP Passthrough
 #
 # Traffic flow:
-#   Client → Traefik (:443) → SNI "www.google.com" → TCP passthrough → telemt
+#   Client → Traefik (:443) → SNI match → TCP passthrough → telemt
 #   Browser → Traefik (:443) → SNI "deploy.aitb.ir" → TLS termination → Dokploy
 #
-# Port 443 is NOT exposed directly. Traefik handles ingress and routes
-# based on the TLS ClientHello SNI. No TLS termination for proxy traffic.
+# Configuration:
+#   Set required ENV variables in Dokploy UI (or .env file for local dev).
+#   The entrypoint generates config.toml automatically at startup.
+#   See .env.example for all variables and documentation.
+#
+# Advanced:
+#   To use a hand-crafted config.toml instead of ENV vars, uncomment
+#   the volume mount below. The entrypoint detects the mounted file
+#   and skips generation.
 # ==============================================================================
 
 services:
@@ -18,23 +25,33 @@ services:
 
     working_dir: /run/telemt
 
-    volumes:
-      - ./config.toml:/run/telemt/config.toml:ro
+    # --- ENV-based configuration (set in Dokploy UI or .env file) ---
+    environment:
+      - TELEMT_SECRET=${TELEMT_SECRET}
+      - TELEMT_SERVER_IP=${TELEMT_SERVER_IP}
+      - TELEMT_PUBLIC_HOST=${TELEMT_PUBLIC_HOST}
+      - TELEMT_TLS_DOMAIN=${TELEMT_TLS_DOMAIN:-www.google.com}
+      - TELEMT_USER_NAME=${TELEMT_USER_NAME:-main}
+      - TELEMT_PORT=${TELEMT_PORT:-443}
+      - TELEMT_PUBLIC_PORT=${TELEMT_PUBLIC_PORT:-443}
+      - TELEMT_LOG_LEVEL=${TELEMT_LOG_LEVEL:-normal}
 
-    # Writable tmpfs for cache (TLS cert emulation, beobachten logs, etc.)
-    # The config.toml bind mount takes precedence over tmpfs for that file.
+    # --- Advanced: mount a static config.toml instead of using ENV vars ---
+    # Uncomment the line below to use a hand-crafted config.toml.
+    # When mounted, the entrypoint skips generation and uses it as-is.
+    # volumes:
+    #   - ./config.toml:/run/telemt/config.toml:ro
+
+    # Writable tmpfs for generated config, TLS cert cache, beobachten logs.
     tmpfs:
       - /run/telemt:rw,mode=1777,size=2m
 
-    environment:
-      - RUST_LOG=info
-
     # --- Traefik TCP Passthrough Labels ---
-    # These tell Traefik's Docker provider to route raw TCP to this container.
-    # Traefik reads the SNI from ClientHello and forwards without TLS termination.
+    # Traefik's Docker provider reads these labels automatically.
+    # Routes raw TCP (no TLS termination) for matching SNI to this container.
     labels:
       - "traefik.enable=true"
-      - "traefik.tcp.routers.telemt-proxy.rule=HostSNI(`www.google.com`)"
+      - "traefik.tcp.routers.telemt-proxy.rule=HostSNI(`${TELEMT_TLS_DOMAIN:-www.google.com}`)"
       - "traefik.tcp.routers.telemt-proxy.entrypoints=websecure"
       - "traefik.tcp.routers.telemt-proxy.tls.passthrough=true"
       - "traefik.tcp.routers.telemt-proxy.service=telemt-proxy"
@@ -44,7 +61,7 @@ services:
     cap_drop:
       - ALL
     cap_add:
-      - NET_BIND_SERVICE   # telemt runs as non-root, needs this for port 443
+      - NET_BIND_SERVICE
     read_only: true
     security_opt:
       - no-new-privileges:true

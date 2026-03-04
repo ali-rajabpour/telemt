@@ -31,7 +31,7 @@ RUN useradd -r -s /usr/sbin/nologin telemt
 WORKDIR /app
 
 COPY --from=builder /build/target/release/telemt /app/telemt
-COPY config.toml /app/config.toml
+COPY entrypoint.sh /app/entrypoint.sh
 
 RUN chown -R telemt:telemt /app
 USER telemt
@@ -39,5 +39,4 @@ USER telemt
 EXPOSE 443
 EXPOSE 9090
 
-ENTRYPOINT ["/app/telemt"]
-CMD ["config.toml"]
+ENTRYPOINT ["/app/entrypoint.sh"]

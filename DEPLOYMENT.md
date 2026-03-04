@@ -11,164 +11,175 @@ Deployed via [Dokploy](https://dokploy.com/) with Traefik TCP passthrough.
 
 ```
 Client (Telegram)
-  │
-  │  TLS ClientHello, SNI = www.google.com
-  ▼
+  |
+  |  TLS ClientHello, SNI = $TELEMT_TLS_DOMAIN
+  v
 Traefik (:443)
-  │
-  │  HostSNI("www.google.com") → TCP passthrough (no TLS termination)
-  ▼
+  |
+  |  HostSNI match -> TCP passthrough (no TLS termination)
+  v
 Telemt container (:443 internal)
-  │
-  │  FakeTLS unwrap → MTProto → Telegram DCs
-  ▼
+  |
+  |  FakeTLS unwrap -> MTProto -> Telegram DCs
+  v
 Telegram Servers
 ```
 
 Traefik routes traffic based on the TLS SNI header:
-- `www.google.com` → raw TCP passthrough to Telemt (proxy traffic)
-- `deploy.aitb.ir` → TLS termination → Dokploy UI (management)
-- Any other SNI → Traefik default handling (404)
+- `$TELEMT_TLS_DOMAIN` SNI -> raw TCP passthrough to Telemt (proxy traffic)
+- `deploy.aitb.ir` SNI -> TLS termination -> Dokploy UI (management)
+- Any other SNI -> Traefik default handling (404)
 
 ---
 
-## What Was Changed
+## Environment Variables
 
-### `config.toml` — Full DPI Evasion Configuration
+Configuration is done entirely through environment variables, set in
+Dokploy's UI or in a `.env` file for local development.
+
+### Required
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `TELEMT_SECRET` | 32-hex proxy secret. Generate: `openssl rand -hex 16` | `545d50e4498f...` |
+| `TELEMT_SERVER_IP` | Server's public IP (for announce/routing) | `47.128.145.75` |
+| `TELEMT_PUBLIC_HOST` | Domain or IP for tg:// links (DNS-only in Cloudflare) | `api.aitb.ir` |
+
+### Optional (have defaults)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TELEMT_TLS_DOMAIN` | `www.google.com` | SNI domain for FakeTLS; must be unblocked in target country |
+| `TELEMT_USER_NAME` | `main` | Internal label for the secret |
+| `TELEMT_PORT` | `443` | Listen port inside the container |
+| `TELEMT_PUBLIC_PORT` | `443` | Port in the tg:// link |
+| `TELEMT_LOG_LEVEL` | `normal` | Verbosity: debug, verbose, normal, silent |
+
+See `.env.example` for full documentation.
+
+---
+
+## DPI Evasion Settings (Built-in)
+
+These are hardcoded in the generated config for maximum stealth.
+They do not need ENV vars because they should not change:
 
 | Setting | Value | Purpose |
 |---------|-------|---------|
-| `tls_domain` | `www.google.com` | SNI that DPI sees; unblocked, high-traffic, plausible on AWS |
-| `mask` | `true` | Failed handshakes forwarded to real Google (active probe masking) |
-| `tls_emulation` | `true` | Fetches real Google TLS cert chain; byte-perfect record sizes |
-| `server_hello_delay` | `50–150ms` | Mimics real HTTPS server response timing |
-| `tls_new_session_tickets` | `2` | Matches Google's TLS 1.3 behavior (zero tickets is anomalous) |
+| `mask` | `true` | Failed handshakes forwarded to real website (active probe masking) |
+| `tls_emulation` | `true` | Byte-perfect TLS certificate emulation from real server |
+| `server_hello_delay` | `50-150ms` | Mimics real HTTPS server response timing |
+| `tls_new_session_tickets` | `2` | Matches typical TLS 1.3 behavior |
 | `tls_full_cert_ttl_secs` | `0` | Every connection gets identical cert (no size variation) |
 | `alpn_enforce` | `true` | Prevents ALPN mismatch detection |
 | `fast_mode` | `true` | Coalesces handshake + payload into single TCP packet |
 | `fast_mode_min_tls_record` | `1400` | Realistic TLS record sizing (matches HTTPS MTU) |
 | `replay_check_len` | `65536` | Blocks DPI replay attack probing |
-| `replay_window_secs` | `1800` | 30-minute replay detection window |
 | `beobachten` | `true` | Tracks suspicious IPs (scanners, crawlers, probers) |
 | `desync_all_full` | `true` | Full forensics for DPI tampering detection |
-| `ntp_check` | `true` | Clock accuracy check (MTProto requires it) |
-| Modes | `tls` only | Classic and Secure disabled (trivially detectable) |
-| Mode | Direct | No Middle-End (simpler, lower overhead) |
-
-### `docker-compose.yml` — Traefik Integration
-
-- **No direct port 443 mapping** — Traefik handles all ingress
-- **Docker labels** tell Traefik to create a TCP passthrough route automatically
-- **`dokploy-network`** (external) — container joins Dokploy's shared network
-- **Security hardening** — read-only filesystem, dropped capabilities, no-new-privileges
-- **2MB tmpfs** at `/run/telemt` for TLS cert cache and beobachten logs
-
-### `setup.sh` — Diagnostic Tool
-
-Optional script for troubleshooting via SSH. Checks:
-- Docker and network status
-- Traefik configuration and Docker socket access
-- Container labels and network membership
-- Port conflicts and stale configurations
-
-### `DEPLOYMENT.md` — This File
+| Modes | `tls` only | Classic and Secure disabled (trivially detectable by DPI) |
 
 ---
 
 ## Prerequisites
 
 1. **Server** with Dokploy installed and Traefik running
-2. **Cloudflare DNS** — A record for the proxy subdomain:
+2. **Cloudflare DNS** -- A record for the proxy subdomain:
    - Type: `A`
-   - Name: `api` (or your chosen subdomain)
+   - Name: your chosen subdomain (e.g., `api`)
    - Content: your server's public IP
    - Proxy status: **DNS only** (gray cloud, NOT orange)
 
-> Cloudflare-proxied (orange cloud) will NOT work — it terminates TLS,
+> Cloudflare-proxied (orange cloud) will NOT work -- it terminates TLS,
 > which destroys the FakeTLS layer that Telemt uses.
 
 ---
 
 ## Deployment via Dokploy
 
-### Step 1 — Remove old deployment
+### Step 1 -- Remove old deployment
 
 If you have an existing Telemt deployment in Dokploy that maps port 443
 directly, stop and delete it first. Direct port mapping conflicts with
 Traefik.
 
-### Step 2 — Create new Compose service
+### Step 2 -- Create new Compose service
 
 1. In Dokploy UI, create a new **Docker Compose** service
-2. Point it to your fork: `https://github.com/ali-rajabpour/telemt`
+2. Point it to: `https://github.com/ali-rajabpour/telemt`
 3. Set the branch to: `personal`
-4. No ENV variables needed — everything is in `config.toml`
 
-### Step 3 — Deploy
+### Step 3 -- Set environment variables
 
-Click **Deploy**. Dokploy runs `docker compose up`. The container starts
-with Traefik labels on `dokploy-network`. Traefik auto-discovers the
-container via the Docker socket and creates the TCP passthrough route.
-
-No manual Traefik configuration required.
-
-### Step 4 — Get the tg:// link
-
-In Dokploy, open the **Logs** tab for the Telemt service. The startup
-output contains the proxy link:
+In the Dokploy service settings, add these ENV variables:
 
 ```
-tg://proxy?server=api.aitb.ir&port=443&secret=ee...
+TELEMT_SECRET=<your 32-hex secret>
+TELEMT_SERVER_IP=<your server public IP>
+TELEMT_PUBLIC_HOST=<your proxy subdomain>
 ```
 
-Share this link with your users.
+Optional (only if you want to override defaults):
+
+```
+TELEMT_TLS_DOMAIN=www.google.com
+TELEMT_USER_NAME=main
+TELEMT_PORT=443
+TELEMT_PUBLIC_PORT=443
+TELEMT_LOG_LEVEL=normal
+```
+
+### Step 4 -- Deploy
+
+Click **Deploy**. What happens automatically:
+
+1. Docker builds the image from the Dockerfile
+2. The entrypoint script generates `config.toml` from your ENV variables
+3. The container starts on `dokploy-network` with Traefik labels
+4. Traefik discovers the container and creates the TCP passthrough route
+5. Proxy is live
+
+### Step 5 -- Get the tg:// link
+
+In Dokploy, open the **Logs** tab. The startup output shows:
+
+```
+[entrypoint] Config generated:
+  secret:      main = 545d50e4...
+  server_ip:   47.128.145.75
+  public_host: api.aitb.ir:443
+  tls_domain:  www.google.com
+[entrypoint] Starting telemt...
+```
+
+The `tg://proxy?server=...&secret=ee...` link appears shortly after.
 
 ---
 
 ## Deploying on a Different Server
 
-The project is fully self-contained. On a new server with Dokploy:
+No code changes needed. Just set different ENV variables in Dokploy:
 
-1. Ensure Cloudflare DNS points your subdomain to the new server IP (gray cloud)
-2. Edit `config.toml`:
-   - Change `announce` in `[[server.listeners]]` to the new server's public IP
-   - Change `public_host` in `[general.links]` to the new subdomain
-3. Deploy through Dokploy UI as described above
+1. Create Cloudflare DNS A record for the new subdomain (gray cloud)
+2. Create a new Compose service in Dokploy pointing to the same repo/branch
+3. Set the three required ENV variables with the new server's values
+4. Deploy
 
 ---
 
-## Managing User Secrets
+## Advanced: Static config.toml
 
-Generate a new secret:
+For multi-user setups or settings not exposed as ENV vars, you can use a
+hand-crafted `config.toml` instead. Uncomment the volume mount in
+`docker-compose.yml`:
 
-```bash
-openssl rand -hex 16
+```yaml
+volumes:
+  - ./config.toml:/run/telemt/config.toml:ro
 ```
 
-Add it to `config.toml` under `[access.users]`:
-
-```toml
-[access.users]
-main = "your_32_hex_secret_here"
-```
-
-Redeploy through Dokploy to apply.
-
-Optional per-user controls (add to `config.toml`):
-
-```toml
-[access.user_max_tcp_conns]
-main = 100
-
-[access.user_max_unique_ips]
-main = 3    # phone + desktop + tablet
-
-[access.user_expirations]
-main = "2026-12-31T23:59:59Z"
-
-[access.user_data_quota]
-main = 107374182400   # 100 GB
-```
+When the entrypoint detects a mounted config.toml, it skips generation
+and uses it as-is. ENV variables are ignored in this mode.
 
 ---
 
@@ -181,8 +192,8 @@ cd /path/to/telemt
 ./setup.sh
 ```
 
-This checks Docker, network, Traefik, container labels, port conflicts,
-and stale configurations. It makes no changes — read-only diagnostics.
+Checks Docker, network, Traefik, container labels, port conflicts,
+and stale configurations. Read-only -- makes no changes.
 
 ---
 
@@ -196,18 +207,17 @@ git fetch upstream
 git merge upstream/main
 ```
 
-Resolve any conflicts in `config.toml` or `docker-compose.yml` (your
-customizations), then push to the `personal` branch.
+Resolve any conflicts in `docker-compose.yml`, `Dockerfile`, or
+`entrypoint.sh` (your customizations), then push to `personal`.
 
 ---
 
 ## Security Notes
 
-- The user secret in `config.toml` is committed to the repo. If your
-  fork is **private**, this is acceptable. If **public**, consider using
-  Dokploy ENV variables or a `.gitignore`d config overlay.
-- Classic and Secure MTProto modes are disabled — only FakeTLS (ee-secrets)
-  is accepted. This is intentional for maximum stealth.
-- The `beobachten` tracker logs suspicious IPs to `cache/beobachten.txt`
-  inside the container's tmpfs. This data is lost on container restart.
-  For persistent tracking, mount an external volume.
+- Secrets are in ENV variables, never committed to git. The `.env` file
+  is in `.gitignore`.
+- Classic and Secure MTProto modes are disabled -- only FakeTLS
+  (ee-secrets) is accepted. This is intentional for maximum stealth.
+- The `beobachten` tracker logs suspicious IPs inside the container's
+  tmpfs. Data is lost on container restart. For persistent tracking,
+  mount an external volume.
