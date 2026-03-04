@@ -1,26 +1,50 @@
+# ==============================================================================
+# Telemt — Docker Compose for Dokploy + Traefik TCP Passthrough
+#
+# Traffic flow:
+#   Client → Traefik (:443) → SNI "www.google.com" → TCP passthrough → telemt
+#   Browser → Traefik (:443) → SNI "deploy.aitb.ir" → TLS termination → Dokploy
+#
+# Port 443 is NOT exposed directly. Traefik handles ingress and routes
+# based on the TLS ClientHello SNI. No TLS termination for proxy traffic.
+# ==============================================================================
+
 services:
   telemt:
     image: ghcr.io/telemt/telemt:latest
     build: .
     container_name: telemt
     restart: unless-stopped
-    ports:
-      - "443:443"
-      - "127.0.0.1:9090:9090"
-    # Allow caching 'proxy-secret' in read-only container
+
     working_dir: /run/telemt
+
     volumes:
       - ./config.toml:/run/telemt/config.toml:ro
+
+    # Writable tmpfs for cache (TLS cert emulation, beobachten logs, etc.)
+    # The config.toml bind mount takes precedence over tmpfs for that file.
     tmpfs:
-      - /run/telemt:rw,mode=1777,size=1m
+      - /run/telemt:rw,mode=1777,size=2m
+
     environment:
       - RUST_LOG=info
-    # Uncomment this line if you want to use host network for IPv6, but bridge is default and usually better
-    # network_mode: host
+
+    # --- Traefik TCP Passthrough Labels ---
+    # These tell Traefik's Docker provider to route raw TCP to this container.
+    # Traefik reads the SNI from ClientHello and forwards without TLS termination.
+    labels:
+      - "traefik.enable=true"
+      - "traefik.tcp.routers.telemt-proxy.rule=HostSNI(`www.google.com`)"
+      - "traefik.tcp.routers.telemt-proxy.entrypoints=websecure"
+      - "traefik.tcp.routers.telemt-proxy.tls.passthrough=true"
+      - "traefik.tcp.routers.telemt-proxy.service=telemt-proxy"
+      - "traefik.tcp.services.telemt-proxy.loadbalancer.server.port=443"
+
+    # --- Security hardening ---
     cap_drop:
       - ALL
     cap_add:
-      - NET_BIND_SERVICE   # allow binding to port 443
+      - NET_BIND_SERVICE   # telemt runs as non-root, needs this for port 443
     read_only: true
     security_opt:
       - no-new-privileges:true
@@ -28,3 +52,10 @@ services:
       nofile:
         soft: 65536
         hard: 65536
+
+    networks:
+      - dokploy-network
+
+networks:
+  dokploy-network:
+    external: true

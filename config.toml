@@ -1,57 +1,179 @@
-### Telemt Based Config.toml
-# We believe that these settings are sufficient for most scenarios 
-# where cutting-egde methods and parameters or special solutions are not needed
+# ==============================================================================
+#
+#   TELEMT — Production Configuration
+#   Optimized for Iran DPI Evasion | Direct Mode | FakeTLS Only
+#
+#   Server:  47.128.145.75 (AWS)
+#   Domain:  api.aitb.ir (DNS-only, gray cloud in Cloudflare)
+#   TLS:     www.google.com (SNI impersonation with real cert emulation)
+#
+# ==============================================================================
 
-# === General Settings ===
+
+# ==============================================================================
+# GENERAL SETTINGS
+# ==============================================================================
+
 [general]
-use_middle_proxy = false
-# Global ad_tag fallback when user has no per-user tag in [access.user_ad_tags]
-# ad_tag = "00000000000000000000000000000000"
-# Per-user ad_tag in [access.user_ad_tags] (32 hex from @MTProxybot)
 
-# === Log Level ===
-# Log level: debug | verbose | normal | silent
-# Can be overridden with --silent or --log-level CLI flags
-# RUST_LOG env var takes absolute priority over all of these
+# Direct mode: connects straight to Telegram DCs via TCP.
+# No Middle-End overhead, no ad_tag, simpler and faster.
+use_middle_proxy = false
+
+# Coalesce MTProto handshake + first payload into a single TCP packet.
+# Reduces latency. No reason to disable.
+fast_mode = true
+
+# Buffer small MTProto packets into ~1400-byte TLS records.
+# Real HTTPS servers send records near MTU size. Tiny records are a DPI signal.
+fast_mode_min_tls_record = 1400
+
+# Verbosity: "debug" | "verbose" | "normal" | "silent"
 log_level = "normal"
+
+# Full forensics for every crypto desync event.
+# Desync errors indicate DPI/firewall is tampering with connections.
+desync_all_full = true
+
+# Active probe tracker — logs suspicious IPs (scanners, crawlers, DPI probers).
+# Output can be fed into fail2ban or iptables for auto-blocking.
+beobachten = true
+beobachten_minutes = 30
+beobachten_flush_secs = 15
+beobachten_file = "cache/beobachten.txt"
+
+# NTP clock check on startup. MTProto uses timestamps; clock drift breaks handshakes.
+ntp_check = true
+ntp_servers = ["pool.ntp.org"]
+
+
+# ==============================================================================
+# ALLOWED CLIENT PROTOCOLS
+# In censored environments, FakeTLS (ee-secrets) must be the ONLY enabled mode.
+# Classic and Secure are trivially detectable by DPI.
+# ==============================================================================
 
 [general.modes]
 classic = false
 secure = false
 tls = true
 
+
+# ==============================================================================
+# STARTUP LINK GENERATION
+# ==============================================================================
+
 [general.links]
 show = "*"
-# show = ["alice", "bob"] # Only show links for alice and bob
-# show = "*"              # Show links for all users
-# public_host = "proxy.example.com"  # Host (IP or domain) for tg:// links
-# public_port = 443                  # Port for tg:// links (default: server.port)
+public_host = "api.aitb.ir"
+public_port = 443
 
-# === Server Binding ===
+
+# ==============================================================================
+# SERVER BINDING
+# ==============================================================================
+
 [server]
 port = 443
-# proxy_protocol = false           # Enable if behind HAProxy/nginx with PROXY protocol
-# metrics_port = 9090
-# metrics_whitelist = ["127.0.0.1", "::1", "0.0.0.0/0"]
 
+# REST API for management (not exposed externally via docker-compose)
 [server.api]
 enabled = true
 listen = "0.0.0.0:9091"
 whitelist = ["127.0.0.0/8"]
-minimal_runtime_enabled = false
-minimal_runtime_cache_ttl_ms = 1000
 
-# Listen on multiple interfaces/IPs - IPv4
 [[server.listeners]]
 ip = "0.0.0.0"
+announce = "47.128.145.75"
 
-# === Anti-Censorship & Masking ===
+
+# ==============================================================================
+# TIMEOUTS (seconds)
+# ==============================================================================
+
+[timeouts]
+
+# Max time for client to complete FakeTLS + MTProto handshake.
+client_handshake = 15
+
+# Max time to establish TCP to upstream Telegram DC.
+tg_connect = 10
+
+# TCP keepalive interval for client connections.
+client_keepalive = 60
+
+# Max client inactivity before dropping the connection.
+client_ack = 300
+
+
+# ==============================================================================
+# ANTI-CENSORSHIP / FAKETLS / DPI EVASION
+# Every setting here makes the proxy harder to detect.
+# ==============================================================================
+
 [censorship]
-tls_domain = "petrovich.ru"
-mask = true
-tls_emulation = true        # Fetch real cert lengths and emulate TLS records
-tls_front_dir = "tlsfront"   # Cache directory for TLS emulation
 
+# --- TLS Domain Fronting ---
+# SNI presented to clients. DPI sees traffic "to" this domain.
+# www.google.com: unblocked in Iran, massive traffic volume, plausible on AWS.
+tls_domain = "www.google.com"
+
+# --- Active Probe Masking ---
+# Failed handshakes (wrong secret) are transparently forwarded to a real website.
+# Active probers see a legitimate Google HTTPS response — not a closed connection.
+# mask_host defaults to tls_domain (www.google.com) when omitted.
+mask = true
+mask_port = 443
+
+# --- TLS Certificate Emulation ---
+# Fetches real TLS 1.3 certificate chain from www.google.com and replicates
+# exact byte sizes of ServerHello and Certificate records.
+# Defeats DPI that uses TLS record length heuristics.
+tls_emulation = true
+tls_front_dir = "tlsfront"
+
+# Fallback fake certificate size when tls_emulation data is unavailable.
+fake_cert_len = 2048
+
+# --- ServerHello Timing ---
+# Real HTTPS servers take 30-150ms to respond (network latency + crypto).
+# A proxy responding in <1ms is a DPI red flag. This adds realistic delay.
+server_hello_delay_min_ms = 50
+server_hello_delay_max_ms = 150
+
+# --- TLS 1.3 Session Tickets ---
+# Real TLS 1.3 servers send 1-2 NewSessionTicket messages after handshake.
+# Zero tickets is anomalous and triggers DPI flags.
+# Google sends 2 tickets. Match this behavior.
+tls_new_session_tickets = 2
+
+# --- Full Certificate Consistency ---
+# 0 = every connection gets the identical full certificate chain.
+# Prevents DPI from detecting size differences between first/repeat connections.
+tls_full_cert_ttl_secs = 0
+
+# --- ALPN Enforcement ---
+# Ensures ServerHello responds with the exact ALPN the client requested.
+# Mismatched ALPN (client says h2, server says http/1.1) is a DPI red flag.
+alpn_enforce = true
+
+
+# ==============================================================================
+# ACCESS CONTROL
+# ==============================================================================
+
+[access]
+
+# --- Replay Attack Protection ---
+# DPI records legitimate handshakes and replays them to probe the server.
+# Telemt remembers recent nonces and rejects duplicates.
+replay_check_len = 65536
+replay_window_secs = 1800
+
+# Reject clients with incorrect system clocks (more secure).
+ignore_time_skew = false
+
+# --- User Secrets ---
+# Generated with: openssl rand -hex 16
 [access.users]
-# format: "username" = "32_hex_chars_secret"
-hello = "00000000000000000000000000000000"
+main = "545d50e4498f858068a14f99c6886741"
