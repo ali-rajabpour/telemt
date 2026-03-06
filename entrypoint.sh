@@ -107,7 +107,6 @@ tls_front_dir = "tlsfront"
 fake_cert_len = 2048
 server_hello_delay_min_ms = 50
 server_hello_delay_max_ms = 150
-tls_new_session_tickets = 2
 tls_full_cert_ttl_secs = 0
 alpn_enforce = true
 

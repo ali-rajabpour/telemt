@@ -142,10 +142,10 @@ server_hello_delay_min_ms = 50
 server_hello_delay_max_ms = 150
 
 # --- TLS 1.3 Session Tickets ---
-# Real TLS 1.3 servers send 1-2 NewSessionTicket messages after handshake.
-# Zero tickets is anomalous and triggers DPI flags.
-# Google sends 2 tickets. Match this behavior.
-tls_new_session_tickets = 2
+# NOTE: Setting this to non-zero breaks Telegram client connectivity.
+# The Telegram FakeTLS client does not handle post-handshake NewSessionTicket
+# records. Leave at 0 (default) despite real TLS servers sending 1-2 tickets.
+# tls_new_session_tickets = 0
 
 # --- Full Certificate Consistency ---
 # 0 = every connection gets the identical full certificate chain.
