@@ -121,7 +121,7 @@ ${TELEMT_USER_NAME} = "${TELEMT_SECRET}"
 ENDOFCONFIG
 
 echo "[entrypoint] Config generated:"
-echo "  secret:      ${TELEMT_USER_NAME} = ${TELEMT_SECRET:0:8}..."
+echo "  secret:      ${TELEMT_USER_NAME} = $(printf '%.8s' "$TELEMT_SECRET")..."
 echo "  server_ip:   ${TELEMT_SERVER_IP}"
 echo "  public_host: ${TELEMT_PUBLIC_HOST}:${TELEMT_PUBLIC_PORT}"
 echo "  tls_domain:  ${TELEMT_TLS_DOMAIN}"
