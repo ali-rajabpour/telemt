@@ -43,6 +43,7 @@ const TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
 
 const GENERAL_CONFIG_KEYS: &[&str] = &[
     "data_path",
+    "quota_state_path",
     "config_strict",
     "modes",
     "prefer_ipv6",

@@ -43,7 +43,7 @@ use events::ApiEventStore;
 use http_utils::{error_response, read_json, read_optional_json, success_response};
 use model::{
     ApiFailure, ClassCount, CreateUserRequest, DeleteUserResponse, HealthData, HealthReadyData,
-    PatchUserRequest, RotateSecretRequest, SummaryData, UserActiveIps,
+    PatchUserRequest, ResetUserQuotaResponse, RotateSecretRequest, SummaryData, UserActiveIps,
 };
 use runtime_edge::{
     EdgeConnectionsCacheEntry, build_runtime_connections_summary_data,
@@ -80,6 +80,7 @@ pub(super) struct ApiShared {
     pub(super) me_pool: Arc<RwLock<Option<Arc<MePool>>>>,
     pub(super) upstream_manager: Arc<UpstreamManager>,
     pub(super) config_path: PathBuf,
+    pub(super) quota_state_path: PathBuf,
     pub(super) detected_ips_rx: watch::Receiver<(Option<IpAddr>, Option<IpAddr>)>,
     pub(super) mutation_lock: Arc<Mutex<()>>,
     pub(super) minimal_cache: Arc<Mutex<Option<MinimalCacheEntry>>>,
@@ -112,6 +113,7 @@ pub async fn serve(
     config_rx: watch::Receiver<Arc<ProxyConfig>>,
     admission_rx: watch::Receiver<bool>,
     config_path: PathBuf,
+    quota_state_path: PathBuf,
     detected_ips_rx: watch::Receiver<(Option<IpAddr>, Option<IpAddr>)>,
     process_started_at_epoch_secs: u64,
     startup_tracker: Arc<StartupTracker>,
@@ -143,6 +145,7 @@ pub async fn serve(
         me_pool,
         upstream_manager,
         config_path,
+        quota_state_path,
         detected_ips_rx,
         mutation_lock: Arc::new(Mutex::new(())),
         minimal_cache: Arc::new(Mutex::new(None)),
@@ -491,6 +494,56 @@ async fn handle(
                 Ok(success_response(status, data, revision))
             }
             _ => {
+                if method == Method::POST
+                    && let Some(user) = normalized_path
+                        .strip_prefix("/v1/users/")
+                        .and_then(|path| path.strip_suffix("/reset-quota"))
+                    && !user.is_empty()
+                    && !user.contains('/')
+                {
+                    if api_cfg.read_only {
+                        return Ok(error_response(
+                            request_id,
+                            ApiFailure::new(
+                                StatusCode::FORBIDDEN,
+                                "read_only",
+                                "API runs in read-only mode",
+                            ),
+                        ));
+                    }
+                    let snapshot = match crate::quota_state::reset_user_quota(
+                        &shared.quota_state_path,
+                        shared.stats.as_ref(),
+                        user,
+                    )
+                    .await
+                    {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            shared.runtime_events.record(
+                                "api.user.reset_quota.failed",
+                                format!("username={} error={}", user, error),
+                            );
+                            return Err(ApiFailure::internal(format!(
+                                "Failed to reset user quota: {}",
+                                error
+                            )));
+                        }
+                    };
+                    shared
+                        .runtime_events
+                        .record("api.user.reset_quota.ok", format!("username={}", user));
+                    let revision = current_revision(&shared.config_path).await?;
+                    return Ok(success_response(
+                        StatusCode::OK,
+                        ResetUserQuotaResponse {
+                            username: user.to_string(),
+                            used_bytes: snapshot.used_bytes,
+                            last_reset_epoch_secs: snapshot.last_reset_epoch_secs,
+                        },
+                        revision,
+                    ));
+                }
                 if let Some(user) = normalized_path.strip_prefix("/v1/users/")
                     && !user.is_empty()
                     && !user.contains('/')

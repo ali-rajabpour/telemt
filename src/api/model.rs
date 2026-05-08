@@ -501,6 +501,13 @@ pub(super) struct DeleteUserResponse {
     pub(super) in_runtime: bool,
 }
 
+#[derive(Serialize)]
+pub(super) struct ResetUserQuotaResponse {
+    pub(super) username: String,
+    pub(super) used_bytes: u64,
+    pub(super) last_reset_epoch_secs: u64,
+}
+
 #[derive(Deserialize)]
 pub(super) struct CreateUserRequest {
     pub(super) username: String,

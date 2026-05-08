@@ -417,6 +417,8 @@ async fn run_telemt_core(
 
     let stats = Arc::new(Stats::new());
     stats.apply_telemetry_policy(TelemetryPolicy::from_config(&config.general.telemetry));
+    let quota_state_path = config.general.quota_state_path.clone();
+    crate::quota_state::load_quota_state(&quota_state_path, stats.as_ref()).await;
 
     let upstream_manager = Arc::new(UpstreamManager::new(
         config.upstreams.clone(),
@@ -496,6 +498,7 @@ async fn run_telemt_core(
             let config_rx_api = api_config_rx.clone();
             let admission_rx_api = admission_rx.clone();
             let config_path_api = config_path.clone();
+            let quota_state_path_api = quota_state_path.clone();
             let startup_tracker_api = startup_tracker.clone();
             let detected_ips_rx_api = detected_ips_rx.clone();
             tokio::spawn(async move {
@@ -509,6 +512,7 @@ async fn run_telemt_core(
                     config_rx_api,
                     admission_rx_api,
                     config_path_api,
+                    quota_state_path_api,
                     detected_ips_rx_api,
                     process_started_at_epoch_secs,
                     startup_tracker_api,
@@ -847,7 +851,7 @@ async fn run_telemt_core(
         max_connections.clone(),
     );
 
-    shutdown::wait_for_shutdown(process_started_at, me_pool, stats).await;
+    shutdown::wait_for_shutdown(process_started_at, me_pool, stats, quota_state_path).await;
 
     Ok(())
 }

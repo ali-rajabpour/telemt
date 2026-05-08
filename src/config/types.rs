@@ -26,6 +26,10 @@ pub enum LogLevel {
     Silent,
 }
 
+fn default_quota_state_path() -> PathBuf {
+    PathBuf::from("telemt.limit.json")
+}
+
 impl LogLevel {
     /// Convert to tracing EnvFilter directive string.
     pub fn to_filter_str(&self) -> &'static str {
@@ -374,6 +378,10 @@ impl Default for NetworkConfig {
 pub struct GeneralConfig {
     #[serde(default)]
     pub data_path: Option<PathBuf>,
+
+    /// JSON state file for runtime per-user quota consumption.
+    #[serde(default = "default_quota_state_path")]
+    pub quota_state_path: PathBuf,
 
     /// Reject unknown TOML config keys during load.
     /// Startup fails fast; hot-reload rejects the new snapshot and keeps the current config.
@@ -979,6 +987,7 @@ impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
             data_path: None,
+            quota_state_path: default_quota_state_path(),
             config_strict: false,
             modes: ProxyModes::default(),
             prefer_ipv6: false,

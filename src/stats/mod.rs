@@ -8,7 +8,7 @@ pub mod telemetry;
 use dashmap::DashMap;
 use lru::LruCache;
 use parking_lot::Mutex;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
@@ -297,7 +297,14 @@ pub struct UserStats {
     /// This counter is the single source of truth for quota enforcement and
     /// intentionally tracks attempted traffic, not guaranteed delivery.
     pub quota_used: AtomicU64,
+    pub quota_last_reset_epoch_secs: AtomicU64,
     pub last_seen_epoch_secs: AtomicU64,
+}
+
+#[derive(Debug, Clone)]
+pub struct UserQuotaSnapshot {
+    pub used_bytes: u64,
+    pub last_reset_epoch_secs: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2406,6 +2413,52 @@ impl Stats {
             .get(user)
             .map(|s| s.quota_used.load(Ordering::Relaxed))
             .unwrap_or(0)
+    }
+
+    pub fn load_user_quota_state(
+        &self,
+        user: &str,
+        used_bytes: u64,
+        last_reset_epoch_secs: u64,
+    ) {
+        let stats = self.get_or_create_user_stats_handle(user);
+        stats.quota_used.store(used_bytes, Ordering::Relaxed);
+        stats
+            .quota_last_reset_epoch_secs
+            .store(last_reset_epoch_secs, Ordering::Relaxed);
+    }
+
+    pub fn reset_user_quota(&self, user: &str) -> UserQuotaSnapshot {
+        let stats = self.get_or_create_user_stats_handle(user);
+        let last_reset_epoch_secs = Self::now_epoch_secs();
+        stats.quota_used.store(0, Ordering::Relaxed);
+        stats
+            .quota_last_reset_epoch_secs
+            .store(last_reset_epoch_secs, Ordering::Relaxed);
+        UserQuotaSnapshot {
+            used_bytes: 0,
+            last_reset_epoch_secs,
+        }
+    }
+
+    pub fn user_quota_snapshot(&self) -> HashMap<String, UserQuotaSnapshot> {
+        let mut out = HashMap::new();
+        for entry in self.user_stats.iter() {
+            let stats = entry.value();
+            let used_bytes = stats.quota_used.load(Ordering::Relaxed);
+            let last_reset_epoch_secs = stats.quota_last_reset_epoch_secs.load(Ordering::Relaxed);
+            if used_bytes == 0 && last_reset_epoch_secs == 0 {
+                continue;
+            }
+            out.insert(
+                entry.key().clone(),
+                UserQuotaSnapshot {
+                    used_bytes,
+                    last_reset_epoch_secs,
+                },
+            );
+        }
+        out
     }
 
     pub fn get_handshake_timeouts(&self) -> u64 {

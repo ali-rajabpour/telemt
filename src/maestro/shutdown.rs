@@ -9,6 +9,7 @@
 //! SIGHUP is handled separately in config/hot_reload.rs for config reload.
 
 use std::sync::Arc;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 #[cfg(not(unix))]
@@ -48,9 +49,10 @@ pub(crate) async fn wait_for_shutdown(
     process_started_at: Instant,
     me_pool: Option<Arc<MePool>>,
     stats: Arc<Stats>,
+    quota_state_path: PathBuf,
 ) {
     let signal = wait_for_shutdown_signal().await;
-    perform_shutdown(signal, process_started_at, me_pool, &stats).await;
+    perform_shutdown(signal, process_started_at, me_pool, &stats, quota_state_path).await;
 }
 
 /// Waits for any shutdown signal (SIGINT, SIGTERM, SIGQUIT).
@@ -79,6 +81,7 @@ async fn perform_shutdown(
     process_started_at: Instant,
     me_pool: Option<Arc<MePool>>,
     stats: &Stats,
+    quota_state_path: PathBuf,
 ) {
     let shutdown_started_at = Instant::now();
     info!(signal = %signal, "Received shutdown signal");
@@ -106,6 +109,22 @@ async fn perform_shutdown(
             Err(_) => {
                 warn!("ME shutdown: RPC_CLOSE_CONN broadcast timed out");
             }
+        }
+    }
+
+    match crate::quota_state::save_quota_state(&quota_state_path, stats).await {
+        Ok(()) => {
+            info!(
+                path = %quota_state_path.display(),
+                "Persisted per-user quota state"
+            );
+        }
+        Err(error) => {
+            warn!(
+                error = %error,
+                path = %quota_state_path.display(),
+                "Failed to persist per-user quota state"
+            );
         }
     }
 
