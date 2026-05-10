@@ -13,6 +13,8 @@ struct CountedWriter {
     fail_writes: bool,
 }
 
+struct StalledWriter;
+
 impl CountedWriter {
     fn new(write_calls: Arc<AtomicUsize>, fail_writes: bool) -> Self {
         Self {
@@ -49,10 +51,34 @@ impl AsyncWrite for CountedWriter {
     }
 }
 
+impl AsyncWrite for StalledWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Pending
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Pending
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Pending
+    }
+}
+
 fn make_crypto_writer(inner: CountedWriter) -> CryptoWriter<CountedWriter> {
     let key = [0u8; 32];
     let iv = 0u128;
     CryptoWriter::new(inner, AesCtr::new(&key, iv), 8 * 1024)
+}
+
+fn make_stalled_crypto_writer() -> CryptoWriter<StalledWriter> {
+    let key = [0u8; 32];
+    let iv = 0u128;
+    CryptoWriter::new(StalledWriter, AesCtr::new(&key, iv), 8 * 1024)
 }
 
 #[tokio::test]
@@ -188,4 +214,54 @@ async fn me_writer_pre_write_quota_reject_happens_before_writer_poll() {
         "write-fail events metric must stay unchanged on pre-write reject"
     );
     assert_eq!(bytes_me2c.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn me_writer_data_write_obeys_flow_cancellation() {
+    let stats = Stats::new();
+    let user = "middle-me-writer-cancel-user";
+    let mut writer = make_stalled_crypto_writer();
+    let mut frame_buf = Vec::new();
+    let bytes_me2c = AtomicU64::new(0);
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    let result = process_me_writer_response_with_traffic_lease(
+        MeResponse::Data {
+            flags: 0,
+            data: Bytes::from_static(&[0x31, 0x32, 0x33, 0x34]),
+            route_permit: None,
+        },
+        &mut writer,
+        ProtoTag::Intermediate,
+        &SecureRandom::new(),
+        &mut frame_buf,
+        &stats,
+        user,
+        None,
+        None,
+        0,
+        None,
+        &cancel,
+        &bytes_me2c,
+        13,
+        true,
+        false,
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(ProxyError::Proxy(ref message)) if message == "ME client writer cancelled"),
+        "cancelled middle writer must return a bounded cancellation error"
+    );
+    assert_eq!(
+        bytes_me2c.load(Ordering::Relaxed),
+        0,
+        "cancelled write must not advance committed ME->C bytes"
+    );
+    assert_eq!(
+        stats.get_user_total_octets(user),
+        0,
+        "cancelled write must not advance user output telemetry"
+    );
 }
