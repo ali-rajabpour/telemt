@@ -251,7 +251,7 @@ async fn me_writer_data_write_obeys_flow_cancellation() {
     .await;
 
     assert!(
-        matches!(result, Err(ProxyError::Proxy(ref message)) if message == "ME client writer cancelled"),
+        matches!(result, Err(ProxyError::MiddleClientWriterCancelled)),
         "cancelled middle writer must return a bounded cancellation error"
     );
     assert_eq!(

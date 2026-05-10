@@ -228,6 +228,15 @@ pub enum ProxyError {
     #[error("Session terminated")]
     RouteSwitched,
 
+    #[error("Traffic budget wait cancelled")]
+    TrafficBudgetWaitCancelled,
+
+    #[error("Traffic budget wait deadline exceeded")]
+    TrafficBudgetWaitDeadlineExceeded,
+
+    #[error("ME client writer cancelled")]
+    MiddleClientWriterCancelled,
+
     // ============= Config Errors =============
     #[error("Config error: {0}")]
     Config(String),

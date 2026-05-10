@@ -697,7 +697,7 @@ async fn wait_for_traffic_budget(
 
         let wait_started_at = Instant::now();
         if deadline.is_some_and(|deadline| wait_started_at >= deadline) {
-            return Err(ProxyError::Proxy("traffic budget wait deadline exceeded".into()));
+            return Err(ProxyError::TrafficBudgetWaitDeadlineExceeded);
         }
         tokio::time::sleep(next_refill_delay()).await;
         let wait_ms = wait_started_at
@@ -741,13 +741,13 @@ async fn wait_for_traffic_budget_or_cancel(
         let wait_started_at = Instant::now();
         if deadline.is_some_and(|deadline| wait_started_at >= deadline) {
             stats.increment_flow_wait_middle_rate_limit_cancelled_total();
-            return Err(ProxyError::Proxy("traffic budget wait deadline exceeded".into()));
+            return Err(ProxyError::TrafficBudgetWaitDeadlineExceeded);
         }
         tokio::select! {
             _ = tokio::time::sleep(next_refill_delay()) => {}
             _ = cancel.cancelled() => {
                 stats.increment_flow_wait_middle_rate_limit_cancelled_total();
-                return Err(ProxyError::Proxy("traffic budget wait cancelled".into()));
+                return Err(ProxyError::TrafficBudgetWaitCancelled);
             }
         }
         let wait_ms = wait_started_at
@@ -2763,7 +2763,7 @@ where
 {
     tokio::select! {
         result = client_writer.write_all(bytes) => result.map_err(ProxyError::Io),
-        _ = cancel.cancelled() => Err(ProxyError::Proxy("ME client writer cancelled".into())),
+        _ = cancel.cancelled() => Err(ProxyError::MiddleClientWriterCancelled),
     }
 }
 
@@ -2776,7 +2776,7 @@ where
 {
     tokio::select! {
         result = client_writer.flush() => result.map_err(ProxyError::Io),
-        _ = cancel.cancelled() => Err(ProxyError::Proxy("ME client writer cancelled".into())),
+        _ = cancel.cancelled() => Err(ProxyError::MiddleClientWriterCancelled),
     }
 }
 
