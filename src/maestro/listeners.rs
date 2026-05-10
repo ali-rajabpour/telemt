@@ -13,7 +13,7 @@ use crate::config::{ProxyConfig, RstOnCloseMode};
 use crate::crypto::SecureRandom;
 use crate::ip_tracker::UserIpTracker;
 use crate::proxy::ClientHandler;
-use crate::proxy::route_mode::{ROUTE_SWITCH_ERROR_MSG, RouteRuntimeController};
+use crate::proxy::route_mode::RouteRuntimeController;
 use crate::proxy::shared_state::ProxySharedState;
 use crate::startup::{COMPONENT_LISTENERS_BIND, StartupTracker};
 use crate::stats::beobachten::BeobachtenStore;
@@ -492,14 +492,10 @@ pub(crate) fn spawn_tcp_accept_loops(
                                 let handshake_close_reason =
                                     expected_handshake_close_description(&e);
 
-                                let me_closed = matches!(
-                                    &e,
-                                    crate::error::ProxyError::Proxy(msg) if msg == "ME connection lost"
-                                );
-                                let route_switched = matches!(
-                                    &e,
-                                    crate::error::ProxyError::Proxy(msg) if msg == ROUTE_SWITCH_ERROR_MSG
-                                );
+                                let me_closed =
+                                    matches!(&e, crate::error::ProxyError::MiddleConnectionLost);
+                                let route_switched =
+                                    matches!(&e, crate::error::ProxyError::RouteSwitched);
 
                                 match (peer_close_reason, me_closed) {
                                     (Some(reason), _) => {

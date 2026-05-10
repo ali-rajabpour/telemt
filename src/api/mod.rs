@@ -5,6 +5,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
@@ -12,8 +13,10 @@ use hyper::header::AUTHORIZATION;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
+use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, RwLock, watch};
+use tokio::sync::{Mutex, RwLock, Semaphore, watch};
+use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::config::{ApiGrayAction, ProxyConfig};
@@ -43,7 +46,8 @@ use events::ApiEventStore;
 use http_utils::{error_response, read_json, read_optional_json, success_response};
 use model::{
     ApiFailure, ClassCount, CreateUserRequest, DeleteUserResponse, HealthData, HealthReadyData,
-    PatchUserRequest, RotateSecretRequest, SummaryData, UserActiveIps,
+    PatchUserRequest, ResetUserQuotaResponse, RotateSecretRequest, SummaryData, UserActiveIps,
+    is_valid_username,
 };
 use runtime_edge::{
     EdgeConnectionsCacheEntry, build_runtime_connections_summary_data,
@@ -66,6 +70,10 @@ use runtime_zero::{
 };
 use users::{create_user, delete_user, patch_user, rotate_secret, users_from_config};
 
+const API_MAX_CONTROL_CONNECTIONS: usize = 1024;
+const API_HTTP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
+const ROUTE_USERNAME_ERROR: &str = "username must match [A-Za-z0-9_.-] and be 1..64 chars";
+
 pub(super) struct ApiRuntimeState {
     pub(super) process_started_at_epoch_secs: u64,
     pub(super) config_reload_count: AtomicU64,
@@ -80,6 +88,7 @@ pub(super) struct ApiShared {
     pub(super) me_pool: Arc<RwLock<Option<Arc<MePool>>>>,
     pub(super) upstream_manager: Arc<UpstreamManager>,
     pub(super) config_path: PathBuf,
+    pub(super) quota_state_path: PathBuf,
     pub(super) detected_ips_rx: watch::Receiver<(Option<IpAddr>, Option<IpAddr>)>,
     pub(super) mutation_lock: Arc<Mutex<()>>,
     pub(super) minimal_cache: Arc<Mutex<Option<MinimalCacheEntry>>>,
@@ -102,6 +111,18 @@ impl ApiShared {
     }
 }
 
+fn auth_header_matches(actual: &str, expected: &str) -> bool {
+    actual.as_bytes().ct_eq(expected.as_bytes()).into()
+}
+
+fn parse_route_username(user: &str) -> Result<&str, ApiFailure> {
+    if is_valid_username(user) {
+        Ok(user)
+    } else {
+        Err(ApiFailure::bad_request(ROUTE_USERNAME_ERROR))
+    }
+}
+
 pub async fn serve(
     listen: SocketAddr,
     stats: Arc<Stats>,
@@ -112,6 +133,7 @@ pub async fn serve(
     config_rx: watch::Receiver<Arc<ProxyConfig>>,
     admission_rx: watch::Receiver<bool>,
     config_path: PathBuf,
+    quota_state_path: PathBuf,
     detected_ips_rx: watch::Receiver<(Option<IpAddr>, Option<IpAddr>)>,
     process_started_at_epoch_secs: u64,
     startup_tracker: Arc<StartupTracker>,
@@ -143,6 +165,7 @@ pub async fn serve(
         me_pool,
         upstream_manager,
         config_path,
+        quota_state_path,
         detected_ips_rx,
         mutation_lock: Arc::new(Mutex::new(())),
         minimal_cache: Arc::new(Mutex::new(None)),
@@ -164,6 +187,8 @@ pub async fn serve(
         shared.runtime_events.clone(),
     );
 
+    let connection_permits = Arc::new(Semaphore::new(API_MAX_CONTROL_CONNECTIONS));
+
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(v) => v,
@@ -173,20 +198,45 @@ pub async fn serve(
             }
         };
 
+        let connection_permit = match connection_permits.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                debug!(
+                    peer = %peer,
+                    max_connections = API_MAX_CONTROL_CONNECTIONS,
+                    "Dropping API connection: control-plane connection budget exhausted"
+                );
+                continue;
+            }
+        };
+
         let shared_conn = shared.clone();
         let config_rx_conn = config_rx.clone();
         tokio::spawn(async move {
+            let _connection_permit = connection_permit;
             let svc = service_fn(move |req: Request<Incoming>| {
                 let shared_req = shared_conn.clone();
                 let config_rx_req = config_rx_conn.clone();
                 async move { handle(req, peer, shared_req, config_rx_req).await }
             });
-            if let Err(error) = http1::Builder::new()
-                .serve_connection(hyper_util::rt::TokioIo::new(stream), svc)
-                .await
+            match timeout(
+                API_HTTP_CONNECTION_TIMEOUT,
+                http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(stream), svc),
+            )
+            .await
             {
-                if !error.is_user() {
-                    debug!(error = %error, "API connection error");
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    if !error.is_user() {
+                        debug!(error = %error, "API connection error");
+                    }
+                }
+                Err(_) => {
+                    debug!(
+                        peer = %peer,
+                        timeout_ms = API_HTTP_CONNECTION_TIMEOUT.as_millis() as u64,
+                        "API connection timed out"
+                    );
                 }
             }
         });
@@ -242,7 +292,7 @@ async fn handle(
             .headers()
             .get(AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .map(|v| v == api_cfg.auth_header)
+            .map(|v| auth_header_matches(v, &api_cfg.auth_header))
             .unwrap_or(false);
         if !auth_ok {
             return Ok(error_response(
@@ -491,10 +541,115 @@ async fn handle(
                 Ok(success_response(status, data, revision))
             }
             _ => {
+                if method == Method::POST
+                    && let Some(user) = normalized_path
+                        .strip_prefix("/v1/users/")
+                        .and_then(|path| path.strip_suffix("/reset-quota"))
+                    && !user.is_empty()
+                    && !user.contains('/')
+                {
+                    let user = parse_route_username(user)?;
+                    if api_cfg.read_only {
+                        return Ok(error_response(
+                            request_id,
+                            ApiFailure::new(
+                                StatusCode::FORBIDDEN,
+                                "read_only",
+                                "API runs in read-only mode",
+                            ),
+                        ));
+                    }
+                    let snapshot = match crate::quota_state::reset_user_quota(
+                        &shared.quota_state_path,
+                        shared.stats.as_ref(),
+                        user,
+                    )
+                    .await
+                    {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            shared.runtime_events.record(
+                                "api.user.reset_quota.failed",
+                                format!("username={} error={}", user, error),
+                            );
+                            return Err(ApiFailure::internal(format!(
+                                "Failed to reset user quota: {}",
+                                error
+                            )));
+                        }
+                    };
+                    shared
+                        .runtime_events
+                        .record("api.user.reset_quota.ok", format!("username={}", user));
+                    let revision = current_revision(&shared.config_path).await?;
+                    return Ok(success_response(
+                        StatusCode::OK,
+                        ResetUserQuotaResponse {
+                            username: user.to_string(),
+                            used_bytes: snapshot.used_bytes,
+                            last_reset_epoch_secs: snapshot.last_reset_epoch_secs,
+                        },
+                        revision,
+                    ));
+                }
+                if method == Method::POST
+                    && let Some(base_user) = normalized_path
+                        .strip_prefix("/v1/users/")
+                        .and_then(|path| path.strip_suffix("/rotate-secret"))
+                    && !base_user.is_empty()
+                    && !base_user.contains('/')
+                {
+                    let base_user = parse_route_username(base_user)?;
+                    if api_cfg.read_only {
+                        return Ok(error_response(
+                            request_id,
+                            ApiFailure::new(
+                                StatusCode::FORBIDDEN,
+                                "read_only",
+                                "API runs in read-only mode",
+                            ),
+                        ));
+                    }
+                    let expected_revision = parse_if_match(req.headers());
+                    let body =
+                        read_optional_json::<RotateSecretRequest>(req.into_body(), body_limit)
+                            .await?;
+                    let result = rotate_secret(
+                        base_user,
+                        body.unwrap_or_default(),
+                        expected_revision,
+                        &shared,
+                    )
+                    .await;
+                    let (mut data, revision) = match result {
+                        Ok(ok) => ok,
+                        Err(error) => {
+                            shared.runtime_events.record(
+                                "api.user.rotate_secret.failed",
+                                format!("username={} code={}", base_user, error.code),
+                            );
+                            return Err(error);
+                        }
+                    };
+                    let runtime_cfg = config_rx.borrow().clone();
+                    data.user.in_runtime =
+                        runtime_cfg.access.users.contains_key(&data.user.username);
+                    shared.runtime_events.record(
+                        "api.user.rotate_secret.ok",
+                        format!("username={}", base_user),
+                    );
+                    let status = if data.user.in_runtime {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::ACCEPTED
+                    };
+                    return Ok(success_response(status, data, revision));
+                }
                 if let Some(user) = normalized_path.strip_prefix("/v1/users/")
                     && !user.is_empty()
                     && !user.contains('/')
                 {
+                    let user = parse_route_username(user)?;
                     if method == Method::GET {
                         let revision = current_revision(&shared.config_path).await?;
                         let disk_cfg = load_config_from_disk(&shared.config_path).await?;
@@ -594,56 +749,6 @@ async fn handle(
                             StatusCode::OK
                         };
                         return Ok(success_response(status, response, revision));
-                    }
-                    if method == Method::POST
-                        && let Some(base_user) = user.strip_suffix("/rotate-secret")
-                        && !base_user.is_empty()
-                        && !base_user.contains('/')
-                    {
-                        if api_cfg.read_only {
-                            return Ok(error_response(
-                                request_id,
-                                ApiFailure::new(
-                                    StatusCode::FORBIDDEN,
-                                    "read_only",
-                                    "API runs in read-only mode",
-                                ),
-                            ));
-                        }
-                        let expected_revision = parse_if_match(req.headers());
-                        let body =
-                            read_optional_json::<RotateSecretRequest>(req.into_body(), body_limit)
-                                .await?;
-                        let result = rotate_secret(
-                            base_user,
-                            body.unwrap_or_default(),
-                            expected_revision,
-                            &shared,
-                        )
-                        .await;
-                        let (mut data, revision) = match result {
-                            Ok(ok) => ok,
-                            Err(error) => {
-                                shared.runtime_events.record(
-                                    "api.user.rotate_secret.failed",
-                                    format!("username={} code={}", base_user, error.code),
-                                );
-                                return Err(error);
-                            }
-                        };
-                        let runtime_cfg = config_rx.borrow().clone();
-                        data.user.in_runtime =
-                            runtime_cfg.access.users.contains_key(&data.user.username);
-                        shared.runtime_events.record(
-                            "api.user.rotate_secret.ok",
-                            format!("username={}", base_user),
-                        );
-                        let status = if data.user.in_runtime {
-                            StatusCode::OK
-                        } else {
-                            StatusCode::ACCEPTED
-                        };
-                        return Ok(success_response(status, data, revision));
                     }
                     if method == Method::POST {
                         return Ok(error_response(

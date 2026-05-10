@@ -25,6 +25,7 @@ mod metrics;
 mod network;
 mod protocol;
 mod proxy;
+mod quota_state;
 mod service;
 mod startup;
 mod stats;

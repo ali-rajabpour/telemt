@@ -465,12 +465,7 @@ pub(super) async fn users_from_config(
             .map(|secret| {
                 build_user_links(cfg, secret, startup_detected_ip_v4, startup_detected_ip_v6)
             })
-            .unwrap_or(UserLinks {
-                classic: Vec::new(),
-                secure: Vec::new(),
-                tls: Vec::new(),
-                tls_domains: Vec::new(),
-            });
+            .unwrap_or_else(empty_user_links);
         users.push(UserInfo {
             in_runtime: runtime_cfg
                 .map(|runtime| runtime.access.users.contains_key(&username))
@@ -509,6 +504,15 @@ pub(super) async fn users_from_config(
         });
     }
     users
+}
+
+fn empty_user_links() -> UserLinks {
+    UserLinks {
+        classic: Vec::new(),
+        secure: Vec::new(),
+        tls: Vec::new(),
+        tls_domains: Vec::new(),
+    }
 }
 
 fn build_user_links(

@@ -26,6 +26,10 @@ pub enum LogLevel {
     Silent,
 }
 
+fn default_quota_state_path() -> PathBuf {
+    PathBuf::from("telemt.limit.json")
+}
+
 impl LogLevel {
     /// Convert to tracing EnvFilter directive string.
     pub fn to_filter_str(&self) -> &'static str {
@@ -375,6 +379,15 @@ pub struct GeneralConfig {
     #[serde(default)]
     pub data_path: Option<PathBuf>,
 
+    /// JSON state file for runtime per-user quota consumption.
+    #[serde(default = "default_quota_state_path")]
+    pub quota_state_path: PathBuf,
+
+    /// Reject unknown TOML config keys during load.
+    /// Startup fails fast; hot-reload rejects the new snapshot and keeps the current config.
+    #[serde(default)]
+    pub config_strict: bool,
+
     #[serde(default)]
     pub modes: ProxyModes,
 
@@ -530,10 +543,17 @@ pub struct GeneralConfig {
     pub me_d2c_frame_buf_shrink_threshold_bytes: usize,
 
     /// Copy buffer size for client->DC direction in direct relay.
+    ///
+    /// This is also the upper bound for one amortized upload rate-limit burst:
+    /// upload debt is settled before the next relay read instead of blocking
+    /// inside the completed read path.
     #[serde(default = "default_direct_relay_copy_buf_c2s_bytes")]
     pub direct_relay_copy_buf_c2s_bytes: usize,
 
     /// Copy buffer size for DC->client direction in direct relay.
+    ///
+    /// This bounds one direct download rate-limit grant because writes are
+    /// clipped to the currently available shaper budget.
     #[serde(default = "default_direct_relay_copy_buf_s2c_bytes")]
     pub direct_relay_copy_buf_s2c_bytes: usize,
 
@@ -974,6 +994,8 @@ impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
             data_path: None,
+            quota_state_path: default_quota_state_path(),
+            config_strict: false,
             modes: ProxyModes::default(),
             prefer_ipv6: false,
             fast_mode: default_true(),
@@ -1876,16 +1898,25 @@ pub struct AccessConfig {
     ///
     /// Each entry supports independent upload (`up_bps`) and download
     /// (`down_bps`) ceilings. A value of `0` in one direction means
-    /// "unlimited" for that direction.
+    /// "unlimited" for that direction. Limits are amortized: a relay quantum
+    /// may pass as a bounded burst, and the limiter applies the resulting wait
+    /// before later traffic in the same direction proceeds.
     #[serde(default)]
     pub user_rate_limits: HashMap<String, RateLimitBps>,
 
     /// Per-CIDR aggregate transport rate limits in bits-per-second.
     ///
     /// Matching uses longest-prefix-wins semantics. A value of `0` in one
-    /// direction means "unlimited" for that direction.
+    /// direction means "unlimited" for that direction. Limits are amortized
+    /// with the same bounded-burst contract as per-user rate limits.
     #[serde(default)]
     pub cidr_rate_limits: HashMap<IpNetwork, RateLimitBps>,
+
+    /// Per-username client source IP/CIDR deny list. Checked after successful
+    /// authentication; matching IPs get the same rejection path as invalid auth
+    /// (handshake fails closed for that connection).
+    #[serde(default)]
+    pub user_source_deny: HashMap<String, Vec<IpNetwork>>,
 
     #[serde(default)]
     pub user_max_unique_ips: HashMap<String, usize>,
@@ -1922,6 +1953,7 @@ impl Default for AccessConfig {
             user_data_quota: HashMap::new(),
             user_rate_limits: HashMap::new(),
             cidr_rate_limits: HashMap::new(),
+            user_source_deny: HashMap::new(),
             user_max_unique_ips: HashMap::new(),
             user_max_unique_ips_global_each: default_user_max_unique_ips_global_each(),
             user_max_unique_ips_mode: UserMaxUniqueIpsMode::default(),
@@ -1930,6 +1962,15 @@ impl Default for AccessConfig {
             replay_window_secs: default_replay_window_secs(),
             ignore_time_skew: false,
         }
+    }
+}
+
+impl AccessConfig {
+    /// Returns true if `ip` is contained in any CIDR listed for `username` under `user_source_deny`.
+    pub fn is_user_source_ip_denied(&self, username: &str, ip: IpAddr) -> bool {
+        self.user_source_deny
+            .get(username)
+            .is_some_and(|nets| nets.iter().any(|n| n.contains(ip)))
     }
 }
 

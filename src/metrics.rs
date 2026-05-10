@@ -11,6 +11,8 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use ipnetwork::IpNetwork;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
+use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::config::ProxyConfig;
@@ -18,12 +20,17 @@ use crate::ip_tracker::UserIpTracker;
 use crate::proxy::shared_state::ProxySharedState;
 use crate::stats::Stats;
 use crate::stats::beobachten::BeobachtenStore;
+use crate::tls_front::TlsFrontCache;
 use crate::tls_front::cache;
 use crate::tls_front::fetcher;
 use crate::transport::{ListenOptions, create_listener};
 
 // Keeps `/metrics` response size bounded when per-user telemetry is enabled.
 const USER_LABELED_METRICS_MAX_USERS: usize = 4096;
+// Keeps TLS-front per-domain health series bounded for large generated configs.
+const TLS_FRONT_PROFILE_HEALTH_MAX_DOMAINS: usize = 256;
+const METRICS_MAX_CONTROL_CONNECTIONS: usize = 512;
+const METRICS_HTTP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub async fn serve(
     port: u16,
@@ -33,6 +40,7 @@ pub async fn serve(
     beobachten: Arc<BeobachtenStore>,
     shared_state: Arc<ProxySharedState>,
     ip_tracker: Arc<UserIpTracker>,
+    tls_cache: Option<Arc<TlsFrontCache>>,
     config_rx: tokio::sync::watch::Receiver<Arc<ProxyConfig>>,
     whitelist: Vec<IpNetwork>,
 ) {
@@ -57,6 +65,7 @@ pub async fn serve(
                     beobachten,
                     shared_state,
                     ip_tracker,
+                    tls_cache,
                     config_rx,
                     whitelist,
                 )
@@ -69,11 +78,11 @@ pub async fn serve(
         return;
     }
 
-    // Fallback: bind on 0.0.0.0 and [::] using metrics_port.
+    // Fallback: keep metrics local unless an explicit metrics_listen is configured.
     let mut listener_v4 = None;
     let mut listener_v6 = None;
 
-    let addr_v4 = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr_v4 = SocketAddr::from(([127, 0, 0, 1], port));
     match bind_metrics_listener(addr_v4, false, listen_backlog) {
         Ok(listener) => {
             info!(
@@ -87,11 +96,11 @@ pub async fn serve(
         }
     }
 
-    let addr_v6 = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], port));
+    let addr_v6 = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], port));
     match bind_metrics_listener(addr_v6, true, listen_backlog) {
         Ok(listener) => {
             info!(
-                "Metrics endpoint: http://[::]:{}/metrics and /beobachten",
+                "Metrics endpoint: http://[::1]:{}/metrics and /beobachten",
                 port
             );
             listener_v6 = Some(listener);
@@ -112,6 +121,7 @@ pub async fn serve(
                 beobachten,
                 shared_state,
                 ip_tracker,
+                tls_cache,
                 config_rx,
                 whitelist,
             )
@@ -122,6 +132,7 @@ pub async fn serve(
             let beobachten_v6 = beobachten.clone();
             let shared_state_v6 = shared_state.clone();
             let ip_tracker_v6 = ip_tracker.clone();
+            let tls_cache_v6 = tls_cache.clone();
             let config_rx_v6 = config_rx.clone();
             let whitelist_v6 = whitelist.clone();
             tokio::spawn(async move {
@@ -131,6 +142,7 @@ pub async fn serve(
                     beobachten_v6,
                     shared_state_v6,
                     ip_tracker_v6,
+                    tls_cache_v6,
                     config_rx_v6,
                     whitelist_v6,
                 )
@@ -142,6 +154,7 @@ pub async fn serve(
                 beobachten,
                 shared_state,
                 ip_tracker,
+                tls_cache,
                 config_rx,
                 whitelist,
             )
@@ -171,9 +184,12 @@ async fn serve_listener(
     beobachten: Arc<BeobachtenStore>,
     shared_state: Arc<ProxySharedState>,
     ip_tracker: Arc<UserIpTracker>,
+    tls_cache: Option<Arc<TlsFrontCache>>,
     config_rx: tokio::sync::watch::Receiver<Arc<ProxyConfig>>,
     whitelist: Arc<Vec<IpNetwork>>,
 ) {
+    let connection_permits = Arc::new(Semaphore::new(METRICS_MAX_CONTROL_CONNECTIONS));
+
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(v) => v,
@@ -188,17 +204,32 @@ async fn serve_listener(
             continue;
         }
 
+        let connection_permit = match connection_permits.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                debug!(
+                    peer = %peer,
+                    max_connections = METRICS_MAX_CONTROL_CONNECTIONS,
+                    "Dropping metrics connection: control-plane connection budget exhausted"
+                );
+                continue;
+            }
+        };
+
         let stats = stats.clone();
         let beobachten = beobachten.clone();
         let shared_state = shared_state.clone();
         let ip_tracker = ip_tracker.clone();
+        let tls_cache = tls_cache.clone();
         let config_rx_conn = config_rx.clone();
         tokio::spawn(async move {
+            let _connection_permit = connection_permit;
             let svc = service_fn(move |req| {
                 let stats = stats.clone();
                 let beobachten = beobachten.clone();
                 let shared_state = shared_state.clone();
                 let ip_tracker = ip_tracker.clone();
+                let tls_cache = tls_cache.clone();
                 let config = config_rx_conn.borrow().clone();
                 async move {
                     handle(
@@ -207,16 +238,29 @@ async fn serve_listener(
                         &beobachten,
                         &shared_state,
                         &ip_tracker,
+                        tls_cache.as_deref(),
                         &config,
                     )
                     .await
                 }
             });
-            if let Err(e) = http1::Builder::new()
-                .serve_connection(hyper_util::rt::TokioIo::new(stream), svc)
-                .await
+            match timeout(
+                METRICS_HTTP_CONNECTION_TIMEOUT,
+                http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(stream), svc),
+            )
+            .await
             {
-                debug!(error = %e, "Metrics connection error");
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    debug!(error = %e, "Metrics connection error");
+                }
+                Err(_) => {
+                    debug!(
+                        peer = %peer,
+                        timeout_ms = METRICS_HTTP_CONNECTION_TIMEOUT.as_millis() as u64,
+                        "Metrics connection timed out"
+                    );
+                }
             }
         });
     }
@@ -228,10 +272,11 @@ async fn handle<B>(
     beobachten: &BeobachtenStore,
     shared_state: &ProxySharedState,
     ip_tracker: &UserIpTracker,
+    tls_cache: Option<&TlsFrontCache>,
     config: &ProxyConfig,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     if req.uri().path() == "/metrics" {
-        let body = render_metrics(stats, shared_state, config, ip_tracker).await;
+        let body = render_metrics(stats, shared_state, config, ip_tracker, tls_cache).await;
         let resp = Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
@@ -266,11 +311,138 @@ fn render_beobachten(beobachten: &BeobachtenStore, config: &ProxyConfig) -> Stri
     beobachten.snapshot_text(ttl)
 }
 
+fn tls_front_domains(config: &ProxyConfig) -> Vec<String> {
+    let mut domains = Vec::with_capacity(1 + config.censorship.tls_domains.len());
+    if !config.censorship.tls_domain.is_empty() {
+        domains.push(config.censorship.tls_domain.clone());
+    }
+    for domain in &config.censorship.tls_domains {
+        if !domain.is_empty() && !domains.contains(domain) {
+            domains.push(domain.clone());
+        }
+    }
+    domains
+}
+
+fn prometheus_label_value(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+async fn render_tls_front_profile_health(
+    out: &mut String,
+    config: &ProxyConfig,
+    tls_cache: Option<&TlsFrontCache>,
+) {
+    use std::fmt::Write;
+
+    let domains = tls_front_domains(config);
+    let (health, suppressed) = match (config.censorship.tls_emulation, tls_cache) {
+        (true, Some(cache)) => {
+            cache
+                .profile_health_snapshot(&domains, TLS_FRONT_PROFILE_HEALTH_MAX_DOMAINS)
+                .await
+        }
+        _ => (Vec::new(), domains.len()),
+    };
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_tls_front_profile_domains TLS front configured profile domains by export status"
+    );
+    let _ = writeln!(out, "# TYPE telemt_tls_front_profile_domains gauge");
+    let _ = writeln!(
+        out,
+        "telemt_tls_front_profile_domains{{status=\"configured\"}} {}",
+        domains.len()
+    );
+    let _ = writeln!(
+        out,
+        "telemt_tls_front_profile_domains{{status=\"emitted\"}} {}",
+        health.len()
+    );
+    let _ = writeln!(
+        out,
+        "telemt_tls_front_profile_domains{{status=\"suppressed\"}} {}",
+        suppressed
+    );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_tls_front_profile_info TLS front profile source and feature flags per configured domain"
+    );
+    let _ = writeln!(out, "# TYPE telemt_tls_front_profile_info gauge");
+    let _ = writeln!(
+        out,
+        "# HELP telemt_tls_front_profile_age_seconds Age of cached TLS front profile data per configured domain"
+    );
+    let _ = writeln!(out, "# TYPE telemt_tls_front_profile_age_seconds gauge");
+    let _ = writeln!(
+        out,
+        "# HELP telemt_tls_front_profile_app_data_records TLS front cached app-data record count per configured domain"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE telemt_tls_front_profile_app_data_records gauge"
+    );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_tls_front_profile_ticket_records TLS front cached ticket-like tail record count per configured domain"
+    );
+    let _ = writeln!(out, "# TYPE telemt_tls_front_profile_ticket_records gauge");
+    let _ = writeln!(
+        out,
+        "# HELP telemt_tls_front_profile_change_cipher_spec_records TLS front cached ChangeCipherSpec record count per configured domain"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE telemt_tls_front_profile_change_cipher_spec_records gauge"
+    );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_tls_front_profile_app_data_bytes TLS front cached total app-data bytes per configured domain"
+    );
+    let _ = writeln!(out, "# TYPE telemt_tls_front_profile_app_data_bytes gauge");
+
+    for item in health {
+        let domain = prometheus_label_value(&item.domain);
+        let _ = writeln!(
+            out,
+            "telemt_tls_front_profile_info{{domain=\"{}\",source=\"{}\",is_default=\"{}\",has_cert_info=\"{}\",has_cert_payload=\"{}\"}} 1",
+            domain, item.source, item.is_default, item.has_cert_info, item.has_cert_payload
+        );
+        let _ = writeln!(
+            out,
+            "telemt_tls_front_profile_age_seconds{{domain=\"{}\"}} {}",
+            domain, item.age_seconds
+        );
+        let _ = writeln!(
+            out,
+            "telemt_tls_front_profile_app_data_records{{domain=\"{}\"}} {}",
+            domain, item.app_data_records
+        );
+        let _ = writeln!(
+            out,
+            "telemt_tls_front_profile_ticket_records{{domain=\"{}\"}} {}",
+            domain, item.ticket_records
+        );
+        let _ = writeln!(
+            out,
+            "telemt_tls_front_profile_change_cipher_spec_records{{domain=\"{}\"}} {}",
+            domain, item.change_cipher_spec_count
+        );
+        let _ = writeln!(
+            out,
+            "telemt_tls_front_profile_app_data_bytes{{domain=\"{}\"}} {}",
+            domain, item.total_app_data_len
+        );
+    }
+}
+
 async fn render_metrics(
     stats: &Stats,
     shared_state: &ProxySharedState,
     config: &ProxyConfig,
     ip_tracker: &UserIpTracker,
+    tls_cache: Option<&TlsFrontCache>,
 ) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(4096);
@@ -423,6 +595,7 @@ async fn render_metrics(
         "telemt_tls_front_full_cert_budget_cap_drops_total {}",
         cache::full_cert_sent_cap_drops_for_metrics()
     );
+    render_tls_front_profile_health(&mut out, config, tls_cache).await;
 
     let _ = writeln!(
         out,
@@ -456,6 +629,21 @@ async fn render_metrics(
 
     let _ = writeln!(
         out,
+        "# HELP telemt_connections_bad_by_class_total Bad/rejected connections by class"
+    );
+    let _ = writeln!(out, "# TYPE telemt_connections_bad_by_class_total counter");
+    if core_enabled {
+        for (class, total) in stats.get_connects_bad_class_counts() {
+            let _ = writeln!(
+                out,
+                "telemt_connections_bad_by_class_total{{class=\"{}\"}} {}",
+                class, total
+            );
+        }
+    }
+
+    let _ = writeln!(
+        out,
         "# HELP telemt_handshake_timeouts_total Handshake timeouts"
     );
     let _ = writeln!(out, "# TYPE telemt_handshake_timeouts_total counter");
@@ -468,6 +656,24 @@ async fn render_metrics(
             0
         }
     );
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_handshake_failures_by_class_total Handshake failures by class"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE telemt_handshake_failures_by_class_total counter"
+    );
+    if core_enabled {
+        for (class, total) in stats.get_handshake_failure_class_counts() {
+            let _ = writeln!(
+                out,
+                "telemt_handshake_failures_by_class_total{{class=\"{}\"}} {}",
+                class, total
+            );
+        }
+    }
 
     let _ = writeln!(
         out,
@@ -515,6 +721,63 @@ async fn render_metrics(
         "telemt_accept_permit_timeout_total {}",
         if core_enabled {
             stats.get_accept_permit_timeout_total()
+        } else {
+            0
+        }
+    );
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_quota_refund_bytes_total Reserved quota bytes returned before commit"
+    );
+    let _ = writeln!(out, "# TYPE telemt_quota_refund_bytes_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_quota_refund_bytes_total {}",
+        if core_enabled {
+            stats.get_quota_refund_bytes_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_quota_contention_total Quota reservation CAS contention events"
+    );
+    let _ = writeln!(out, "# TYPE telemt_quota_contention_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_quota_contention_total {}",
+        if core_enabled {
+            stats.get_quota_contention_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_quota_contention_timeout_total Quota reservations that hit the bounded contention budget"
+    );
+    let _ = writeln!(out, "# TYPE telemt_quota_contention_timeout_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_quota_contention_timeout_total {}",
+        if core_enabled {
+            stats.get_quota_contention_timeout_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_quota_acquire_cancelled_total Quota acquisitions cancelled before reservation completed"
+    );
+    let _ = writeln!(out, "# TYPE telemt_quota_acquire_cancelled_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_quota_acquire_cancelled_total {}",
+        if core_enabled {
+            stats.get_quota_acquire_cancelled_total()
         } else {
             0
         }
@@ -634,6 +897,29 @@ async fn render_metrics(
     );
 
     let limiter_metrics = shared_state.traffic_limiter.metrics_snapshot();
+    let _ = writeln!(
+        out,
+        "# HELP telemt_rate_limiter_burst_bound_bytes Configured upper bound for one direct relay rate-limit burst"
+    );
+    let _ = writeln!(out, "# TYPE telemt_rate_limiter_burst_bound_bytes gauge");
+    let _ = writeln!(
+        out,
+        "telemt_rate_limiter_burst_bound_bytes{{direction=\"up\"}} {}",
+        if core_enabled {
+            config.general.direct_relay_copy_buf_c2s_bytes
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "telemt_rate_limiter_burst_bound_bytes{{direction=\"down\"}} {}",
+        if core_enabled {
+            config.general.direct_relay_copy_buf_s2c_bytes
+        } else {
+            0
+        }
+    );
     let _ = writeln!(
         out,
         "# HELP telemt_rate_limiter_throttle_total Traffic limiter throttle events by scope and direction"
@@ -1732,6 +2018,85 @@ async fn render_metrics(
         "telemt_me_d2c_quota_reject_total{{stage=\"post_write\"}} {}",
         if me_allows_normal {
             stats.get_me_d2c_quota_reject_post_write_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_child_join_timeout_total Middle relay child tasks that did not join before cleanup deadline"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_child_join_timeout_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_me_child_join_timeout_total {}",
+        if core_enabled {
+            stats.get_me_child_join_timeout_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_child_abort_total Middle relay child tasks aborted after bounded cleanup timeout"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_child_abort_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_me_child_abort_total {}",
+        if core_enabled {
+            stats.get_me_child_abort_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_flow_wait_events_total Flow wait events by reason, direction, and outcome"
+    );
+    let _ = writeln!(out, "# TYPE telemt_flow_wait_events_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_flow_wait_events_total{{reason=\"middle_rate_limit\",direction=\"down\",outcome=\"waited\"}} {}",
+        if core_enabled {
+            stats.get_flow_wait_middle_rate_limit_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "telemt_flow_wait_events_total{{reason=\"middle_rate_limit\",direction=\"down\",outcome=\"cancelled\"}} {}",
+        if core_enabled {
+            stats.get_flow_wait_middle_rate_limit_cancelled_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_flow_wait_ms_total Flow wait time in milliseconds by reason and direction"
+    );
+    let _ = writeln!(out, "# TYPE telemt_flow_wait_ms_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_flow_wait_ms_total{{reason=\"middle_rate_limit\",direction=\"down\"}} {}",
+        if core_enabled {
+            stats.get_flow_wait_middle_rate_limit_ms_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_session_drop_fallback_total Session reservations cleaned by Drop instead of explicit async release"
+    );
+    let _ = writeln!(out, "# TYPE telemt_session_drop_fallback_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_session_drop_fallback_total {}",
+        if core_enabled {
+            stats.get_session_drop_fallback_total()
         } else {
             0
         }
@@ -3328,6 +3693,11 @@ mod tests {
     use super::*;
     use http_body_util::BodyExt;
     use std::net::IpAddr;
+    use std::time::SystemTime;
+
+    use crate::tls_front::types::{
+        CachedTlsData, ParsedServerHello, TlsBehaviorProfile, TlsCertPayload, TlsProfileSource,
+    };
 
     #[tokio::test]
     async fn test_render_metrics_format() {
@@ -3342,8 +3712,9 @@ mod tests {
 
         stats.increment_connects_all();
         stats.increment_connects_all();
-        stats.increment_connects_bad();
+        stats.increment_connects_bad_with_class("tls_handshake_bad_client");
         stats.increment_handshake_timeouts();
+        stats.increment_handshake_failure_class("timeout");
         shared_state
             .handshake
             .auth_expensive_checks_total
@@ -3395,7 +3766,7 @@ mod tests {
             .await
             .unwrap();
 
-        let output = render_metrics(&stats, shared_state.as_ref(), &config, &tracker).await;
+        let output = render_metrics(&stats, shared_state.as_ref(), &config, &tracker, None).await;
 
         assert!(output.contains(&format!(
             "telemt_build_info{{version=\"{}\"}} 1",
@@ -3403,7 +3774,11 @@ mod tests {
         )));
         assert!(output.contains("telemt_connections_total 2"));
         assert!(output.contains("telemt_connections_bad_total 1"));
+        assert!(output.contains(
+            "telemt_connections_bad_by_class_total{class=\"tls_handshake_bad_client\"} 1"
+        ));
         assert!(output.contains("telemt_handshake_timeouts_total 1"));
+        assert!(output.contains("telemt_handshake_failures_by_class_total{class=\"timeout\"} 1"));
         assert!(output.contains("telemt_auth_expensive_checks_total 9"));
         assert!(output.contains("telemt_auth_budget_exhausted_total 2"));
         assert!(output.contains("telemt_upstream_connect_attempt_total 2"));
@@ -3458,12 +3833,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_render_tls_front_profile_health() {
+        let stats = Stats::new();
+        let shared_state = ProxySharedState::new();
+        let tracker = UserIpTracker::new();
+        let mut config = ProxyConfig::default();
+        config.censorship.tls_domain = "primary.example".to_string();
+        config.censorship.tls_domains = vec!["fallback.example".to_string()];
+
+        let cache = TlsFrontCache::new(
+            &[
+                "primary.example".to_string(),
+                "fallback.example".to_string(),
+            ],
+            1024,
+            "tlsfront-profile-health-test",
+        );
+        cache
+            .set(
+                "primary.example",
+                CachedTlsData {
+                    server_hello_template: ParsedServerHello {
+                        version: [0x03, 0x03],
+                        random: [0u8; 32],
+                        session_id: Vec::new(),
+                        cipher_suite: [0x13, 0x01],
+                        compression: 0,
+                        extensions: Vec::new(),
+                    },
+                    cert_info: None,
+                    cert_payload: Some(TlsCertPayload {
+                        cert_chain_der: vec![vec![0x30, 0x01]],
+                        certificate_message: vec![0x0b, 0x00, 0x00, 0x00],
+                    }),
+                    app_data_records_sizes: vec![1024, 512],
+                    total_app_data_len: 1536,
+                    behavior_profile: TlsBehaviorProfile {
+                        change_cipher_spec_count: 1,
+                        app_data_record_sizes: vec![1024, 512],
+                        ticket_record_sizes: vec![69],
+                        source: TlsProfileSource::Merged,
+                    },
+                    fetched_at: SystemTime::now(),
+                    domain: "primary.example".to_string(),
+                },
+            )
+            .await;
+
+        let output = render_metrics(&stats, &shared_state, &config, &tracker, Some(&cache)).await;
+
+        assert!(output.contains("telemt_tls_front_profile_domains{status=\"configured\"} 2"));
+        assert!(output.contains("telemt_tls_front_profile_domains{status=\"emitted\"} 2"));
+        assert!(output.contains("telemt_tls_front_profile_domains{status=\"suppressed\"} 0"));
+        assert!(
+            output.contains("telemt_tls_front_profile_info{domain=\"primary.example\",source=\"merged\",is_default=\"false\",has_cert_info=\"false\",has_cert_payload=\"true\"} 1")
+        );
+        assert!(
+            output.contains("telemt_tls_front_profile_info{domain=\"fallback.example\",source=\"default\",is_default=\"true\",has_cert_info=\"false\",has_cert_payload=\"false\"} 1")
+        );
+        assert!(
+            output.contains(
+                "telemt_tls_front_profile_app_data_records{domain=\"primary.example\"} 2"
+            )
+        );
+        assert!(
+            output
+                .contains("telemt_tls_front_profile_ticket_records{domain=\"primary.example\"} 1")
+        );
+        assert!(output.contains(
+            "telemt_tls_front_profile_change_cipher_spec_records{domain=\"primary.example\"} 1"
+        ));
+        assert!(
+            output.contains(
+                "telemt_tls_front_profile_app_data_bytes{domain=\"primary.example\"} 1536"
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn test_render_empty_stats() {
         let stats = Stats::new();
         let shared_state = ProxySharedState::new();
         let tracker = UserIpTracker::new();
         let config = ProxyConfig::default();
-        let output = render_metrics(&stats, &shared_state, &config, &tracker).await;
+        let output = render_metrics(&stats, &shared_state, &config, &tracker, None).await;
         assert!(output.contains("telemt_connections_total 0"));
         assert!(output.contains("telemt_connections_bad_total 0"));
         assert!(output.contains("telemt_handshake_timeouts_total 0"));
@@ -3487,7 +3940,7 @@ mod tests {
         let mut config = ProxyConfig::default();
         config.access.user_max_unique_ips_global_each = 2;
 
-        let output = render_metrics(&stats, &shared_state, &config, &tracker).await;
+        let output = render_metrics(&stats, &shared_state, &config, &tracker, None).await;
 
         assert!(output.contains("telemt_user_unique_ips_limit{user=\"alice\"} 2"));
         assert!(output.contains("telemt_user_unique_ips_utilization{user=\"alice\"} 0.500000"));
@@ -3499,11 +3952,13 @@ mod tests {
         let shared_state = ProxySharedState::new();
         let tracker = UserIpTracker::new();
         let config = ProxyConfig::default();
-        let output = render_metrics(&stats, &shared_state, &config, &tracker).await;
+        let output = render_metrics(&stats, &shared_state, &config, &tracker, None).await;
         assert!(output.contains("# TYPE telemt_uptime_seconds gauge"));
         assert!(output.contains("# TYPE telemt_connections_total counter"));
         assert!(output.contains("# TYPE telemt_connections_bad_total counter"));
+        assert!(output.contains("# TYPE telemt_connections_bad_by_class_total counter"));
         assert!(output.contains("# TYPE telemt_handshake_timeouts_total counter"));
+        assert!(output.contains("# TYPE telemt_handshake_failures_by_class_total counter"));
         assert!(output.contains("# TYPE telemt_auth_expensive_checks_total counter"));
         assert!(output.contains("# TYPE telemt_auth_budget_exhausted_total counter"));
         assert!(output.contains("# TYPE telemt_upstream_connect_attempt_total counter"));
@@ -3546,6 +4001,15 @@ mod tests {
         assert!(
             output.contains("# TYPE telemt_tls_front_full_cert_budget_cap_drops_total counter")
         );
+        assert!(output.contains("# TYPE telemt_tls_front_profile_domains gauge"));
+        assert!(output.contains("# TYPE telemt_tls_front_profile_info gauge"));
+        assert!(output.contains("# TYPE telemt_tls_front_profile_age_seconds gauge"));
+        assert!(output.contains("# TYPE telemt_tls_front_profile_app_data_records gauge"));
+        assert!(output.contains("# TYPE telemt_tls_front_profile_ticket_records gauge"));
+        assert!(
+            output.contains("# TYPE telemt_tls_front_profile_change_cipher_spec_records gauge")
+        );
+        assert!(output.contains("# TYPE telemt_tls_front_profile_app_data_bytes gauge"));
     }
 
     #[tokio::test]
@@ -3566,6 +4030,7 @@ mod tests {
             &beobachten,
             shared_state.as_ref(),
             &tracker,
+            None,
             &config,
         )
         .await
@@ -3600,6 +4065,7 @@ mod tests {
             &beobachten,
             shared_state.as_ref(),
             &tracker,
+            None,
             &config,
         )
         .await
@@ -3617,6 +4083,7 @@ mod tests {
             &beobachten,
             shared_state.as_ref(),
             &tracker,
+            None,
             &config,
         )
         .await

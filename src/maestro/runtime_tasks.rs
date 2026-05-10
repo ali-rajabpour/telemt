@@ -21,6 +21,7 @@ use crate::startup::{
 use crate::stats::beobachten::BeobachtenStore;
 use crate::stats::telemetry::TelemetryPolicy;
 use crate::stats::{ReplayChecker, Stats};
+use crate::tls_front::TlsFrontCache;
 use crate::transport::UpstreamManager;
 use crate::transport::middle_proxy::{MePool, MeReinitTrigger};
 
@@ -52,6 +53,7 @@ pub(crate) async fn spawn_runtime_tasks(
     api_config_tx: watch::Sender<Arc<ProxyConfig>>,
     me_pool_for_policy: Option<Arc<MePool>>,
     shared_state: Arc<ProxySharedState>,
+    me_ready_tx: watch::Sender<u64>,
 ) -> RuntimeWatches {
     let um_clone = upstream_manager.clone();
     let dc_overrides_for_health = config.dc_overrides.clone();
@@ -69,6 +71,18 @@ pub(crate) async fn spawn_runtime_tasks(
     let rc_clone = replay_checker.clone();
     tokio::spawn(async move {
         rc_clone.run_periodic_cleanup().await;
+    });
+
+    let stats_maintenance = stats.clone();
+    tokio::spawn(async move {
+        stats_maintenance
+            .run_periodic_user_stats_maintenance()
+            .await;
+    });
+
+    let ip_tracker_maintenance = ip_tracker.clone();
+    tokio::spawn(async move {
+        ip_tracker_maintenance.run_periodic_maintenance().await;
     });
 
     let detected_ip_v4: Option<IpAddr> = probe.detected_ipv4.map(IpAddr::V4);
@@ -249,12 +263,14 @@ pub(crate) async fn spawn_runtime_tasks(
         let pool_clone_sched = pool.clone();
         let rng_clone_sched = rng.clone();
         let config_rx_clone_sched = config_rx.clone();
+        let me_ready_tx_sched = me_ready_tx.clone();
         tokio::spawn(async move {
             crate::transport::middle_proxy::me_reinit_scheduler(
                 pool_clone_sched,
                 rng_clone_sched,
                 config_rx_clone_sched,
                 reinit_rx,
+                me_ready_tx_sched,
             )
             .await;
         });
@@ -328,6 +344,7 @@ pub(crate) async fn spawn_metrics_if_configured(
     beobachten: Arc<BeobachtenStore>,
     shared_state: Arc<ProxySharedState>,
     ip_tracker: Arc<UserIpTracker>,
+    tls_cache: Option<Arc<TlsFrontCache>>,
     config_rx: watch::Receiver<Arc<ProxyConfig>>,
 ) {
     // metrics_listen takes precedence; fall back to metrics_port for backward compat.
@@ -363,6 +380,7 @@ pub(crate) async fn spawn_metrics_if_configured(
         let shared_state = shared_state.clone();
         let config_rx_metrics = config_rx.clone();
         let ip_tracker_metrics = ip_tracker.clone();
+        let tls_cache_metrics = tls_cache.clone();
         let whitelist = config.server.metrics_whitelist.clone();
         let listen_backlog = config.server.listen_backlog;
         tokio::spawn(async move {
@@ -374,6 +392,7 @@ pub(crate) async fn spawn_metrics_if_configured(
                 beobachten,
                 shared_state,
                 ip_tracker_metrics,
+                tls_cache_metrics,
                 config_rx_metrics,
                 whitelist,
             )

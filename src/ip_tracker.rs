@@ -32,6 +32,7 @@ pub struct UserIpTracker {
     limit_mode: Arc<RwLock<UserMaxUniqueIpsMode>>,
     limit_window: Arc<RwLock<Duration>>,
     last_compact_epoch_secs: Arc<AtomicU64>,
+    cleanup_queue_len: Arc<AtomicU64>,
     cleanup_queue: Arc<Mutex<HashMap<(String, IpAddr), usize>>>,
     cleanup_drain_lock: Arc<AsyncMutex<()>>,
 }
@@ -72,6 +73,7 @@ impl UserIpTracker {
             limit_mode: Arc::new(RwLock::new(UserMaxUniqueIpsMode::ActiveWindow)),
             limit_window: Arc::new(RwLock::new(Duration::from_secs(30))),
             last_compact_epoch_secs: Arc::new(AtomicU64::new(0)),
+            cleanup_queue_len: Arc::new(AtomicU64::new(0)),
             cleanup_queue: Arc::new(Mutex::new(HashMap::new())),
             cleanup_drain_lock: Arc::new(AsyncMutex::new(())),
         }
@@ -120,6 +122,9 @@ impl UserIpTracker {
         match self.cleanup_queue.lock() {
             Ok(mut queue) => {
                 let count = queue.entry((user, ip)).or_insert(0);
+                if *count == 0 {
+                    self.cleanup_queue_len.fetch_add(1, Ordering::Relaxed);
+                }
                 *count = count.saturating_add(1);
                 self.cleanup_deferred_releases
                     .fetch_add(1, Ordering::Relaxed);
@@ -127,6 +132,9 @@ impl UserIpTracker {
             Err(poisoned) => {
                 let mut queue = poisoned.into_inner();
                 let count = queue.entry((user.clone(), ip)).or_insert(0);
+                if *count == 0 {
+                    self.cleanup_queue_len.fetch_add(1, Ordering::Relaxed);
+                }
                 *count = count.saturating_add(1);
                 self.cleanup_deferred_releases
                     .fetch_add(1, Ordering::Relaxed);
@@ -156,6 +164,9 @@ impl UserIpTracker {
     }
 
     pub(crate) async fn drain_cleanup_queue(&self) {
+        if self.cleanup_queue_len.load(Ordering::Relaxed) == 0 {
+            return;
+        }
         let Ok(_drain_guard) = self.cleanup_drain_lock.try_lock() else {
             return;
         };
@@ -173,6 +184,7 @@ impl UserIpTracker {
                             break;
                         };
                         if let Some(count) = queue.remove(&key) {
+                            self.cleanup_queue_len.fetch_sub(1, Ordering::Relaxed);
                             drained.insert(key, count);
                         }
                     }
@@ -191,6 +203,7 @@ impl UserIpTracker {
                             break;
                         };
                         if let Some(count) = queue.remove(&key) {
+                            self.cleanup_queue_len.fetch_sub(1, Ordering::Relaxed);
                             drained.insert(key, count);
                         }
                     }
@@ -294,12 +307,17 @@ impl UserIpTracker {
         }
     }
 
+    pub async fn run_periodic_maintenance(self: Arc<Self>) {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            self.drain_cleanup_queue().await;
+            self.maybe_compact_empty_users().await;
+        }
+    }
+
     pub async fn memory_stats(&self) -> UserIpTrackerMemoryStats {
-        let cleanup_queue_len = self
-            .cleanup_queue
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .len();
+        let cleanup_queue_len = self.cleanup_queue_len.load(Ordering::Relaxed) as usize;
         let active_ips = self.active_ips.read().await;
         let recent_ips = self.recent_ips.read().await;
         let active_entries = active_ips.values().map(HashMap::len).sum();

@@ -637,6 +637,22 @@ fn unknown_dc_log_path_revalidation_rejects_parent_swapped_to_symlink() {
             "telemt-unknown-dc-parent-swap-{}",
             std::process::id()
         ));
+    if let Ok(meta) = fs::symlink_metadata(&parent) {
+        if meta.file_type().is_symlink() || meta.is_file() {
+            fs::remove_file(&parent).expect("stale parent-swap path must be removable");
+        } else {
+            fs::remove_dir_all(&parent).expect("stale parent-swap directory must be removable");
+        }
+    }
+    let moved = parent.with_extension("bak");
+    if let Ok(meta) = fs::symlink_metadata(&moved) {
+        if meta.file_type().is_symlink() || meta.is_file() {
+            fs::remove_file(&moved).expect("stale parent-swap backup path must be removable");
+        } else {
+            fs::remove_dir_all(&moved)
+                .expect("stale parent-swap backup directory must be removable");
+        }
+    }
     fs::create_dir_all(&parent).expect("parent-swap test parent must be creatable");
 
     let rel_candidate = format!(
@@ -646,8 +662,6 @@ fn unknown_dc_log_path_revalidation_rejects_parent_swapped_to_symlink() {
     let sanitized = sanitize_unknown_dc_log_path(&rel_candidate)
         .expect("candidate must sanitize before parent swap");
 
-    let moved = parent.with_extension("bak");
-    let _ = fs::remove_dir_all(&moved);
     fs::rename(&parent, &moved).expect("parent must be movable for swap simulation");
     symlink("/tmp", &parent).expect("symlink replacement for parent must be creatable");
 
@@ -720,6 +734,24 @@ fn adversarial_parent_swap_after_check_is_blocked_by_anchored_open() {
             "telemt-unknown-dc-parent-swap-openat-{}",
             std::process::id()
         ));
+    if let Ok(meta) = fs::symlink_metadata(&base) {
+        if meta.file_type().is_symlink() || meta.is_file() {
+            fs::remove_file(&base).expect("stale parent-swap-openat path must be removable");
+        } else {
+            fs::remove_dir_all(&base)
+                .expect("stale parent-swap-openat directory must be removable");
+        }
+    }
+    let moved = base.with_extension("bak");
+    if let Ok(meta) = fs::symlink_metadata(&moved) {
+        if meta.file_type().is_symlink() || meta.is_file() {
+            fs::remove_file(&moved)
+                .expect("stale parent-swap-openat backup path must be removable");
+        } else {
+            fs::remove_dir_all(&moved)
+                .expect("stale parent-swap-openat backup directory must be removable");
+        }
+    }
     fs::create_dir_all(&base).expect("parent-swap-openat base must be creatable");
 
     let rel_candidate = format!(
@@ -743,8 +775,6 @@ fn adversarial_parent_swap_after_check_is_blocked_by_anchored_open() {
     let outside_target = outside_parent.join("unknown-dc.log");
     let _ = fs::remove_file(&outside_target);
 
-    let moved = base.with_extension("bak");
-    let _ = fs::remove_dir_all(&moved);
     fs::rename(&base, &moved).expect("base parent must be movable for swap simulation");
     symlink(&outside_parent, &base).expect("base parent symlink replacement must be creatable");
 
@@ -1489,10 +1519,7 @@ async fn direct_relay_cutover_midflight_releases_route_gauge() {
         "cutover should terminate direct relay session"
     );
     assert!(
-        matches!(
-            relay_result,
-            Err(ProxyError::Proxy(ref msg)) if msg == ROUTE_SWITCH_ERROR_MSG
-        ),
+        matches!(relay_result, Err(ProxyError::RouteSwitched)),
         "client-visible cutover error must stay generic and avoid route-internal metadata"
     );
 
@@ -1629,10 +1656,7 @@ async fn direct_relay_cutover_storm_multi_session_keeps_generic_errors_and_relea
             .expect("direct relay task must not panic");
 
         assert!(
-            matches!(
-                relay_result,
-                Err(ProxyError::Proxy(ref msg)) if msg == ROUTE_SWITCH_ERROR_MSG
-            ),
+            matches!(relay_result, Err(ProxyError::RouteSwitched)),
             "storm-cutover termination must remain generic for all direct sessions"
         );
     }
@@ -1935,10 +1959,7 @@ async fn adversarial_direct_relay_cutover_integrity() {
         .expect("Session must not panic");
 
     assert!(
-        matches!(
-            result,
-            Err(ProxyError::Proxy(ref msg)) if msg == ROUTE_SWITCH_ERROR_MSG
-        ),
+        matches!(result, Err(ProxyError::RouteSwitched)),
         "Session must terminate with route switch error on cutover"
     );
 }

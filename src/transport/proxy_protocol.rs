@@ -18,6 +18,9 @@ const PROXY_V1_MIN_LEN: usize = 6;
 /// Minimum length for v2 header
 const PROXY_V2_MIN_LEN: usize = 16;
 
+/// Maximum accepted PROXY v2 address and TLV payload.
+const PROXY_V2_MAX_ADDR_LEN: usize = 216;
+
 /// Address families for v2
 mod address_family {
     pub const UNSPEC: u8 = 0x0;
@@ -169,6 +172,9 @@ async fn parse_v2<R: AsyncRead + Unpin>(
 
     let family_protocol = header[13];
     let addr_len = u16::from_be_bytes([header[14], header[15]]) as usize;
+    if addr_len > PROXY_V2_MAX_ADDR_LEN {
+        return Err(ProxyError::InvalidProxyProtocol);
+    }
 
     // Read address data
     let mut addr_data = vec![0u8; addr_len];

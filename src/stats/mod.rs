@@ -8,8 +8,8 @@ pub mod telemetry;
 use dashmap::DashMap;
 use lru::LruCache;
 use parking_lot::Mutex;
-use std::collections::VecDeque;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -274,11 +274,22 @@ pub struct Stats {
     me_inline_recovery_total: AtomicU64,
     ip_reservation_rollback_tcp_limit_total: AtomicU64,
     ip_reservation_rollback_quota_limit_total: AtomicU64,
+    quota_refund_bytes_total: AtomicU64,
+    quota_contention_total: AtomicU64,
+    quota_contention_timeout_total: AtomicU64,
+    quota_acquire_cancelled_total: AtomicU64,
     quota_write_fail_bytes_total: AtomicU64,
     quota_write_fail_events_total: AtomicU64,
+    me_child_join_timeout_total: AtomicU64,
+    me_child_abort_total: AtomicU64,
+    flow_wait_middle_rate_limit_total: AtomicU64,
+    flow_wait_middle_rate_limit_cancelled_total: AtomicU64,
+    flow_wait_middle_rate_limit_ms_total: AtomicU64,
+    session_drop_fallback_total: AtomicU64,
     telemetry_core_enabled: AtomicBool,
     telemetry_user_enabled: AtomicBool,
     telemetry_me_level: AtomicU8,
+    cached_epoch_secs: AtomicU64,
     user_stats: DashMap<String, Arc<UserStats>>,
     user_stats_last_cleanup_epoch_secs: AtomicU64,
     start_time: parking_lot::RwLock<Option<Instant>>,
@@ -297,7 +308,14 @@ pub struct UserStats {
     /// This counter is the single source of truth for quota enforcement and
     /// intentionally tracks attempted traffic, not guaranteed delivery.
     pub quota_used: AtomicU64,
+    pub quota_last_reset_epoch_secs: AtomicU64,
     pub last_seen_epoch_secs: AtomicU64,
+}
+
+#[derive(Debug, Clone)]
+pub struct UserQuotaSnapshot {
+    pub used_bytes: u64,
+    pub last_reset_epoch_secs: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -341,6 +359,7 @@ impl Stats {
     pub fn new() -> Self {
         let stats = Self::default();
         stats.apply_telemetry_policy(TelemetryPolicy::default());
+        stats.refresh_cached_epoch_secs();
         *stats.start_time.write() = Some(Instant::now());
         stats
     }
@@ -390,25 +409,47 @@ impl Stats {
             .as_secs()
     }
 
-    fn touch_user_stats(stats: &UserStats) {
+    fn refresh_cached_epoch_secs(&self) -> u64 {
+        let now_epoch_secs = Self::now_epoch_secs();
+        self.cached_epoch_secs
+            .store(now_epoch_secs, Ordering::Relaxed);
+        now_epoch_secs
+    }
+
+    fn cached_epoch_secs(&self) -> u64 {
+        let cached = self.cached_epoch_secs.load(Ordering::Relaxed);
+        if cached != 0 {
+            return cached;
+        }
+        self.refresh_cached_epoch_secs()
+    }
+
+    fn touch_user_stats(&self, stats: &UserStats) {
         stats
             .last_seen_epoch_secs
-            .store(Self::now_epoch_secs(), Ordering::Relaxed);
+            .store(self.cached_epoch_secs(), Ordering::Relaxed);
     }
 
     pub(crate) fn get_or_create_user_stats_handle(&self, user: &str) -> Arc<UserStats> {
-        self.maybe_cleanup_user_stats();
         if let Some(existing) = self.user_stats.get(user) {
             let handle = Arc::clone(existing.value());
-            Self::touch_user_stats(handle.as_ref());
+            self.touch_user_stats(handle.as_ref());
             return handle;
         }
 
         let entry = self.user_stats.entry(user.to_string()).or_default();
         if entry.last_seen_epoch_secs.load(Ordering::Relaxed) == 0 {
-            Self::touch_user_stats(entry.value().as_ref());
+            self.touch_user_stats(entry.value().as_ref());
         }
         Arc::clone(entry.value())
+    }
+
+    pub(crate) async fn run_periodic_user_stats_maintenance(self: Arc<Self>) {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            self.maybe_cleanup_user_stats();
+        }
     }
 
     #[inline]
@@ -416,7 +457,7 @@ impl Stats {
         if !self.telemetry_user_enabled() {
             return;
         }
-        Self::touch_user_stats(user_stats);
+        self.touch_user_stats(user_stats);
         user_stats
             .octets_from_client
             .fetch_add(bytes, Ordering::Relaxed);
@@ -427,7 +468,7 @@ impl Stats {
         if !self.telemetry_user_enabled() {
             return;
         }
-        Self::touch_user_stats(user_stats);
+        self.touch_user_stats(user_stats);
         user_stats
             .octets_to_client
             .fetch_add(bytes, Ordering::Relaxed);
@@ -438,7 +479,7 @@ impl Stats {
         if !self.telemetry_user_enabled() {
             return;
         }
-        Self::touch_user_stats(user_stats);
+        self.touch_user_stats(user_stats);
         user_stats.msgs_from_client.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -447,7 +488,7 @@ impl Stats {
         if !self.telemetry_user_enabled() {
             return;
         }
-        Self::touch_user_stats(user_stats);
+        self.touch_user_stats(user_stats);
         user_stats.msgs_to_client.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -457,7 +498,7 @@ impl Stats {
     /// mixing reserve and post-charge on a single I/O event.
     #[inline]
     pub(crate) fn quota_charge_post_write(&self, user_stats: &UserStats, bytes: u64) -> u64 {
-        Self::touch_user_stats(user_stats);
+        self.touch_user_stats(user_stats);
         user_stats
             .quota_used
             .fetch_add(bytes, Ordering::Relaxed)
@@ -468,7 +509,7 @@ impl Stats {
         const USER_STATS_CLEANUP_INTERVAL_SECS: u64 = 60;
         const USER_STATS_IDLE_TTL_SECS: u64 = 24 * 60 * 60;
 
-        let now_epoch_secs = Self::now_epoch_secs();
+        let now_epoch_secs = self.refresh_cached_epoch_secs();
         let last_cleanup_epoch_secs = self
             .user_stats_last_cleanup_epoch_secs
             .load(Ordering::Relaxed);
@@ -1430,6 +1471,29 @@ impl Stats {
                 .fetch_add(1, Ordering::Relaxed);
         }
     }
+    pub fn add_quota_refund_bytes_total(&self, bytes: u64) {
+        if self.telemetry_core_enabled() {
+            self.quota_refund_bytes_total
+                .fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_quota_contention_total(&self) {
+        if self.telemetry_core_enabled() {
+            self.quota_contention_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_quota_contention_timeout_total(&self) {
+        if self.telemetry_core_enabled() {
+            self.quota_contention_timeout_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_quota_acquire_cancelled_total(&self) {
+        if self.telemetry_core_enabled() {
+            self.quota_acquire_cancelled_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
     pub fn add_quota_write_fail_bytes_total(&self, bytes: u64) {
         if self.telemetry_core_enabled() {
             self.quota_write_fail_bytes_total
@@ -1439,6 +1503,37 @@ impl Stats {
     pub fn increment_quota_write_fail_events_total(&self) {
         if self.telemetry_core_enabled() {
             self.quota_write_fail_events_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_child_join_timeout_total(&self) {
+        if self.telemetry_core_enabled() {
+            self.me_child_join_timeout_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_child_abort_total(&self) {
+        if self.telemetry_core_enabled() {
+            self.me_child_abort_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn observe_flow_wait_middle_rate_limit_ms(&self, wait_ms: u64) {
+        if self.telemetry_core_enabled() {
+            self.flow_wait_middle_rate_limit_total
+                .fetch_add(1, Ordering::Relaxed);
+            self.flow_wait_middle_rate_limit_ms_total
+                .fetch_add(wait_ms, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_flow_wait_middle_rate_limit_cancelled_total(&self) {
+        if self.telemetry_core_enabled() {
+            self.flow_wait_middle_rate_limit_cancelled_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_session_drop_fallback_total(&self) {
+        if self.telemetry_core_enabled() {
+            self.session_drop_fallback_total
                 .fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -2276,11 +2371,44 @@ impl Stats {
         self.ip_reservation_rollback_quota_limit_total
             .load(Ordering::Relaxed)
     }
+    pub fn get_quota_refund_bytes_total(&self) -> u64 {
+        self.quota_refund_bytes_total.load(Ordering::Relaxed)
+    }
+    pub fn get_quota_contention_total(&self) -> u64 {
+        self.quota_contention_total.load(Ordering::Relaxed)
+    }
+    pub fn get_quota_contention_timeout_total(&self) -> u64 {
+        self.quota_contention_timeout_total.load(Ordering::Relaxed)
+    }
+    pub fn get_quota_acquire_cancelled_total(&self) -> u64 {
+        self.quota_acquire_cancelled_total.load(Ordering::Relaxed)
+    }
     pub fn get_quota_write_fail_bytes_total(&self) -> u64 {
         self.quota_write_fail_bytes_total.load(Ordering::Relaxed)
     }
     pub fn get_quota_write_fail_events_total(&self) -> u64 {
         self.quota_write_fail_events_total.load(Ordering::Relaxed)
+    }
+    pub fn get_me_child_join_timeout_total(&self) -> u64 {
+        self.me_child_join_timeout_total.load(Ordering::Relaxed)
+    }
+    pub fn get_me_child_abort_total(&self) -> u64 {
+        self.me_child_abort_total.load(Ordering::Relaxed)
+    }
+    pub fn get_flow_wait_middle_rate_limit_total(&self) -> u64 {
+        self.flow_wait_middle_rate_limit_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_flow_wait_middle_rate_limit_cancelled_total(&self) -> u64 {
+        self.flow_wait_middle_rate_limit_cancelled_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_flow_wait_middle_rate_limit_ms_total(&self) -> u64 {
+        self.flow_wait_middle_rate_limit_ms_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_session_drop_fallback_total(&self) -> u64 {
+        self.session_drop_fallback_total.load(Ordering::Relaxed)
     }
 
     pub fn increment_user_connects(&self, user: &str) {
@@ -2288,7 +2416,7 @@ impl Stats {
             return;
         }
         let stats = self.get_or_create_user_stats_handle(user);
-        Self::touch_user_stats(stats.as_ref());
+        self.touch_user_stats(stats.as_ref());
         stats.connects.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -2297,7 +2425,7 @@ impl Stats {
             return;
         }
         let stats = self.get_or_create_user_stats_handle(user);
-        Self::touch_user_stats(stats.as_ref());
+        self.touch_user_stats(stats.as_ref());
         stats.curr_connects.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -2307,7 +2435,7 @@ impl Stats {
         }
 
         let stats = self.get_or_create_user_stats_handle(user);
-        Self::touch_user_stats(stats.as_ref());
+        self.touch_user_stats(stats.as_ref());
 
         let counter = &stats.curr_connects;
         let mut current = counter.load(Ordering::Relaxed);
@@ -2330,9 +2458,8 @@ impl Stats {
     }
 
     pub fn decrement_user_curr_connects(&self, user: &str) {
-        self.maybe_cleanup_user_stats();
         if let Some(stats) = self.user_stats.get(user) {
-            Self::touch_user_stats(stats.value().as_ref());
+            self.touch_user_stats(stats.value().as_ref());
             let counter = &stats.curr_connects;
             let mut current = counter.load(Ordering::Relaxed);
             loop {
@@ -2406,6 +2533,47 @@ impl Stats {
             .get(user)
             .map(|s| s.quota_used.load(Ordering::Relaxed))
             .unwrap_or(0)
+    }
+
+    pub fn load_user_quota_state(&self, user: &str, used_bytes: u64, last_reset_epoch_secs: u64) {
+        let stats = self.get_or_create_user_stats_handle(user);
+        stats.quota_used.store(used_bytes, Ordering::Relaxed);
+        stats
+            .quota_last_reset_epoch_secs
+            .store(last_reset_epoch_secs, Ordering::Relaxed);
+    }
+
+    pub fn reset_user_quota(&self, user: &str) -> UserQuotaSnapshot {
+        let stats = self.get_or_create_user_stats_handle(user);
+        let last_reset_epoch_secs = Self::now_epoch_secs();
+        stats.quota_used.store(0, Ordering::Relaxed);
+        stats
+            .quota_last_reset_epoch_secs
+            .store(last_reset_epoch_secs, Ordering::Relaxed);
+        UserQuotaSnapshot {
+            used_bytes: 0,
+            last_reset_epoch_secs,
+        }
+    }
+
+    pub fn user_quota_snapshot(&self) -> HashMap<String, UserQuotaSnapshot> {
+        let mut out = HashMap::new();
+        for entry in self.user_stats.iter() {
+            let stats = entry.value();
+            let used_bytes = stats.quota_used.load(Ordering::Relaxed);
+            let last_reset_epoch_secs = stats.quota_last_reset_epoch_secs.load(Ordering::Relaxed);
+            if used_bytes == 0 && last_reset_epoch_secs == 0 {
+                continue;
+            }
+            out.insert(
+                entry.key().clone(),
+                UserQuotaSnapshot {
+                    used_bytes,
+                    last_reset_epoch_secs,
+                },
+            );
+        }
+        out
     }
 
     pub fn get_handshake_timeouts(&self) -> u64 {

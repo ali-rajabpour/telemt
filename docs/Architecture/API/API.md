@@ -178,6 +178,21 @@ Notes:
 | `data_quota_bytes` | `u64` | no | Per-user traffic quota. |
 | `max_unique_ips` | `usize` | no | Per-user unique source IP limit. |
 
+### `access.user_source_deny` via API
+- In current API surface, per-user deny-list is **not** exposed as a dedicated field in `CreateUserRequest` / `PatchUserRequest`.
+- Configure it in `config.toml` under `[access.user_source_deny]` and apply via normal config reload path.
+- Runtime behavior after apply:
+  - auth succeeds for username/secret
+  - source IP is checked against `access.user_source_deny[username]`
+  - on match, handshake is rejected with the same fail-closed outcome as invalid auth
+
+Example config:
+```toml
+[access.user_source_deny]
+alice = ["203.0.113.0/24", "2001:db8:abcd::/48"]
+bob = ["198.51.100.42/32"]
+```
+
 ### `RotateSecretRequest`
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |

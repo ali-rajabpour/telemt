@@ -4,9 +4,66 @@ use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use std::task::{Context, Poll, Wake};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::time::Instant;
+
+enum ReadStep {
+    Data(Vec<u8>),
+    Pending,
+    Eof,
+    Error,
+}
+
+struct ScriptedReader {
+    scripted_reads: Arc<Mutex<VecDeque<ReadStep>>>,
+    read_calls: Arc<AtomicUsize>,
+}
+
+impl ScriptedReader {
+    fn new(script: Vec<ReadStep>, read_calls: Arc<AtomicUsize>) -> Self {
+        Self {
+            scripted_reads: Arc::new(Mutex::new(script.into())),
+            read_calls,
+        }
+    }
+}
+
+impl AsyncRead for ScriptedReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        this.read_calls.fetch_add(1, Ordering::Relaxed);
+        let step = this
+            .scripted_reads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pop_front()
+            .unwrap_or(ReadStep::Eof);
+        match step {
+            ReadStep::Data(data) => {
+                let n = data.len().min(buf.remaining());
+                buf.put_slice(&data[..n]);
+                Poll::Ready(Ok(()))
+            }
+            ReadStep::Pending => Poll::Pending,
+            ReadStep::Eof => Poll::Ready(Ok(())),
+            ReadStep::Error => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "forced read failure",
+            ))),
+        }
+    }
+}
+
+struct NoopWake;
+
+impl Wake for NoopWake {
+    fn wake(self: Arc<Self>) {}
+}
 
 struct ScriptedWriter {
     scripted_writes: Arc<Mutex<VecDeque<usize>>>,
@@ -78,6 +135,127 @@ fn make_stats_io_with_script(
     );
 
     (io, stats, write_calls, quota_exceeded)
+}
+
+fn make_stats_io_with_read_script(
+    user: &str,
+    quota_limit: u64,
+    precharged_quota: u64,
+    script: Vec<ReadStep>,
+) -> (
+    StatsIo<ScriptedReader>,
+    Arc<Stats>,
+    Arc<AtomicUsize>,
+    Arc<AtomicBool>,
+) {
+    let stats = Arc::new(Stats::new());
+    if precharged_quota > 0 {
+        let user_stats = stats.get_or_create_user_stats_handle(user);
+        stats.quota_charge_post_write(user_stats.as_ref(), precharged_quota);
+    }
+
+    let read_calls = Arc::new(AtomicUsize::new(0));
+    let quota_exceeded = Arc::new(AtomicBool::new(false));
+    let io = StatsIo::new(
+        ScriptedReader::new(script, read_calls.clone()),
+        Arc::new(SharedCounters::new()),
+        stats.clone(),
+        user.to_string(),
+        Some(quota_limit),
+        quota_exceeded.clone(),
+        Instant::now(),
+    );
+
+    (io, stats, read_calls, quota_exceeded)
+}
+
+fn poll_read_once<R: AsyncRead + Unpin>(
+    io: &mut StatsIo<R>,
+    storage: &mut [u8],
+) -> Poll<io::Result<usize>> {
+    let waker = Arc::new(NoopWake).into();
+    let mut cx = Context::from_waker(&waker);
+    let mut read_buf = ReadBuf::new(storage);
+    let before = read_buf.filled().len();
+    match Pin::new(io).poll_read(&mut cx, &mut read_buf) {
+        Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len() - before)),
+        Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+        Poll::Pending => Poll::Pending,
+    }
+}
+
+#[test]
+fn direct_c2s_quota_refunds_unused_on_short_read() {
+    let user = "direct-c2s-short-read-refund-user";
+    let (mut io, stats, read_calls, quota_exceeded) =
+        make_stats_io_with_read_script(user, 64, 0, vec![ReadStep::Data(vec![0x11; 5])]);
+    let mut storage = [0u8; 16];
+
+    let n = match poll_read_once(&mut io, &mut storage) {
+        Poll::Ready(Ok(n)) => n,
+        other => panic!("short read must complete, got {other:?}"),
+    };
+
+    assert_eq!(n, 5);
+    assert_eq!(read_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.get_user_quota_used(user), 5);
+    assert_eq!(stats.get_quota_refund_bytes_total(), 11);
+    assert!(!quota_exceeded.load(Ordering::Acquire));
+}
+
+#[test]
+fn direct_c2s_quota_refunds_full_reservation_on_pending() {
+    let user = "direct-c2s-pending-refund-user";
+    let (mut io, stats, read_calls, quota_exceeded) =
+        make_stats_io_with_read_script(user, 64, 0, vec![ReadStep::Pending]);
+    let mut storage = [0u8; 16];
+
+    assert!(matches!(
+        poll_read_once(&mut io, &mut storage),
+        Poll::Pending
+    ));
+    assert_eq!(read_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.get_user_quota_used(user), 0);
+    assert_eq!(stats.get_quota_refund_bytes_total(), 16);
+    assert!(!quota_exceeded.load(Ordering::Acquire));
+}
+
+#[test]
+fn direct_c2s_quota_refunds_full_reservation_on_eof() {
+    let user = "direct-c2s-eof-refund-user";
+    let (mut io, stats, read_calls, quota_exceeded) =
+        make_stats_io_with_read_script(user, 64, 0, vec![ReadStep::Eof]);
+    let mut storage = [0u8; 16];
+
+    let n = match poll_read_once(&mut io, &mut storage) {
+        Poll::Ready(Ok(n)) => n,
+        other => panic!("EOF read must complete with zero bytes, got {other:?}"),
+    };
+
+    assert_eq!(n, 0);
+    assert_eq!(read_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.get_user_quota_used(user), 0);
+    assert_eq!(stats.get_quota_refund_bytes_total(), 16);
+    assert!(!quota_exceeded.load(Ordering::Acquire));
+}
+
+#[test]
+fn direct_c2s_quota_refunds_full_reservation_on_error() {
+    let user = "direct-c2s-error-refund-user";
+    let (mut io, stats, read_calls, quota_exceeded) =
+        make_stats_io_with_read_script(user, 64, 0, vec![ReadStep::Error]);
+    let mut storage = [0u8; 16];
+
+    let error = match poll_read_once(&mut io, &mut storage) {
+        Poll::Ready(Err(error)) => error,
+        other => panic!("error read must return error, got {other:?}"),
+    };
+
+    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    assert_eq!(read_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.get_user_quota_used(user), 0);
+    assert_eq!(stats.get_quota_refund_bytes_total(), 16);
+    assert!(!quota_exceeded.load(Ordering::Acquire));
 }
 
 #[tokio::test]

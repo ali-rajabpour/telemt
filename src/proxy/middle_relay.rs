@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
 use crate::config::{ConntrackPressureProfile, ProxyConfig};
@@ -22,8 +23,7 @@ use crate::error::{ProxyError, Result};
 use crate::protocol::constants::{secure_padding_len, *};
 use crate::proxy::handshake::HandshakeSuccess;
 use crate::proxy::route_mode::{
-    ROUTE_SWITCH_ERROR_MSG, RelayRouteMode, RouteCutoverState, affected_cutover_state,
-    cutover_stagger_delay,
+    RelayRouteMode, RouteCutoverState, affected_cutover_state, cutover_stagger_delay,
 };
 use crate::proxy::shared_state::{
     ConntrackCloseEvent, ConntrackClosePublishResult, ConntrackCloseReason, ProxySharedState,
@@ -65,6 +65,15 @@ const ME_D2C_SINGLE_WRITE_COALESCE_MAX_BYTES: usize = 128 * 1024;
 const QUOTA_RESERVE_SPIN_RETRIES: usize = 32;
 const QUOTA_RESERVE_BACKOFF_MIN_MS: u64 = 1;
 const QUOTA_RESERVE_BACKOFF_MAX_MS: u64 = 16;
+const QUOTA_RESERVE_MAX_BACKOFF_ROUNDS: usize = 16;
+const ME_CHILD_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+enum MiddleQuotaReserveError {
+    LimitExceeded,
+    Contended,
+    Cancelled,
+    DeadlineExceeded,
+}
 
 #[derive(Default)]
 pub(crate) struct DesyncDedupRotationState {
@@ -622,21 +631,43 @@ async fn reserve_user_quota_with_yield(
     user_stats: &UserStats,
     bytes: u64,
     limit: u64,
-) -> std::result::Result<u64, QuotaReserveError> {
+    stats: &Stats,
+    cancel: &CancellationToken,
+    deadline: Option<Instant>,
+) -> std::result::Result<u64, MiddleQuotaReserveError> {
     let mut backoff_ms = QUOTA_RESERVE_BACKOFF_MIN_MS;
+    let mut backoff_rounds = 0usize;
     loop {
         for _ in 0..QUOTA_RESERVE_SPIN_RETRIES {
             match user_stats.quota_try_reserve(bytes, limit) {
                 Ok(total) => return Ok(total),
                 Err(QuotaReserveError::LimitExceeded) => {
-                    return Err(QuotaReserveError::LimitExceeded);
+                    return Err(MiddleQuotaReserveError::LimitExceeded);
                 }
-                Err(QuotaReserveError::Contended) => std::hint::spin_loop(),
+                Err(QuotaReserveError::Contended) => {
+                    stats.increment_quota_contention_total();
+                    std::hint::spin_loop();
+                }
             }
         }
 
         tokio::task::yield_now().await;
-        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            stats.increment_quota_contention_timeout_total();
+            return Err(MiddleQuotaReserveError::DeadlineExceeded);
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
+            _ = cancel.cancelled() => {
+                stats.increment_quota_acquire_cancelled_total();
+                return Err(MiddleQuotaReserveError::Cancelled);
+            }
+        }
+        backoff_rounds = backoff_rounds.saturating_add(1);
+        if backoff_rounds >= QUOTA_RESERVE_MAX_BACKOFF_ROUNDS {
+            stats.increment_quota_contention_timeout_total();
+            return Err(MiddleQuotaReserveError::Contended);
+        }
         backoff_ms = backoff_ms
             .saturating_mul(2)
             .min(QUOTA_RESERVE_BACKOFF_MAX_MS);
@@ -647,12 +678,13 @@ async fn wait_for_traffic_budget(
     lease: Option<&Arc<TrafficLease>>,
     direction: RateDirection,
     bytes: u64,
-) {
+    deadline: Option<Instant>,
+) -> Result<()> {
     if bytes == 0 {
-        return;
+        return Ok(());
     }
     let Some(lease) = lease else {
-        return;
+        return Ok(());
     };
 
     let mut remaining = bytes;
@@ -664,6 +696,9 @@ async fn wait_for_traffic_budget(
         }
 
         let wait_started_at = Instant::now();
+        if deadline.is_some_and(|deadline| wait_started_at >= deadline) {
+            return Err(ProxyError::TrafficBudgetWaitDeadlineExceeded);
+        }
         tokio::time::sleep(next_refill_delay()).await;
         let wait_ms = wait_started_at
             .elapsed()
@@ -676,6 +711,59 @@ async fn wait_for_traffic_budget(
             wait_ms,
         );
     }
+
+    Ok(())
+}
+
+async fn wait_for_traffic_budget_or_cancel(
+    lease: Option<&Arc<TrafficLease>>,
+    direction: RateDirection,
+    bytes: u64,
+    cancel: &CancellationToken,
+    stats: &Stats,
+    deadline: Option<Instant>,
+) -> Result<()> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    let Some(lease) = lease else {
+        return Ok(());
+    };
+
+    let mut remaining = bytes;
+    while remaining > 0 {
+        let consume = lease.try_consume(direction, remaining);
+        if consume.granted > 0 {
+            remaining = remaining.saturating_sub(consume.granted);
+            continue;
+        }
+
+        let wait_started_at = Instant::now();
+        if deadline.is_some_and(|deadline| wait_started_at >= deadline) {
+            stats.increment_flow_wait_middle_rate_limit_cancelled_total();
+            return Err(ProxyError::TrafficBudgetWaitDeadlineExceeded);
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(next_refill_delay()) => {}
+            _ = cancel.cancelled() => {
+                stats.increment_flow_wait_middle_rate_limit_cancelled_total();
+                return Err(ProxyError::TrafficBudgetWaitCancelled);
+            }
+        }
+        let wait_ms = wait_started_at
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        lease.observe_wait_ms(
+            direction,
+            consume.blocked_user,
+            consume.blocked_cidr,
+            wait_ms,
+        );
+        stats.observe_flow_wait_middle_rate_limit_ms(wait_ms);
+    }
+
+    Ok(())
 }
 
 fn classify_me_d2c_flush_reason(
@@ -1114,7 +1202,7 @@ where
         tokio::time::sleep(delay).await;
         let _ = me_pool.send_close(conn_id).await;
         me_pool.registry().unregister(conn_id).await;
-        return Err(ProxyError::Proxy(ROUTE_SWITCH_ERROR_MSG.to_string()));
+        return Err(ProxyError::RouteSwitched);
     }
 
     // Per-user ad_tag from access.user_ad_tags; fallback to general.ad_tag (hot-reloadable)
@@ -1169,7 +1257,7 @@ where
     let c2me_byte_semaphore = Arc::new(Semaphore::new(c2me_byte_budget));
     let (c2me_tx, mut c2me_rx) = mpsc::channel::<C2MeCommand>(c2me_channel_capacity);
     let me_pool_c2me = me_pool.clone();
-    let c2me_sender = tokio::spawn(async move {
+    let mut c2me_sender = tokio::spawn(async move {
         let mut sent_since_yield = 0usize;
         while let Some(cmd) = c2me_rx.recv().await {
             match cmd {
@@ -1205,16 +1293,18 @@ where
     });
 
     let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
+    let flow_cancel = CancellationToken::new();
     let mut me_rx_task = me_rx;
     let stats_clone = stats.clone();
     let rng_clone = rng.clone();
     let user_clone = user.clone();
     let quota_user_stats_me_writer = quota_user_stats.clone();
     let traffic_lease_me_writer = traffic_lease.clone();
+    let flow_cancel_me_writer = flow_cancel.clone();
     let last_downstream_activity_ms_clone = last_downstream_activity_ms.clone();
     let bytes_me2c_clone = bytes_me2c.clone();
     let d2c_flush_policy = MeD2cFlushPolicy::from_config(&config);
-    let me_writer = tokio::spawn(async move {
+    let mut me_writer = tokio::spawn(async move {
         let mut writer = crypto_writer;
         let mut frame_buf = Vec::with_capacity(16 * 1024);
         let shrink_threshold = d2c_flush_policy.frame_buf_shrink_threshold_bytes;
@@ -1234,7 +1324,7 @@ where
                     let Some(first) = msg else {
                         debug!(conn_id, "ME channel closed");
                         shrink_session_vec(&mut frame_buf, shrink_threshold);
-                        return Err(ProxyError::Proxy("ME connection lost".into()));
+                        return Err(ProxyError::MiddleConnectionLost);
                     };
 
                     let mut batch_frames = 0usize;
@@ -1256,6 +1346,7 @@ where
                         quota_limit,
                         d2c_flush_policy.quota_soft_overshoot_bytes,
                         traffic_lease_me_writer.as_ref(),
+                        &flow_cancel_me_writer,
                         bytes_me2c_clone.as_ref(),
                         conn_id,
                         d2c_flush_policy.ack_flush_immediate,
@@ -1276,7 +1367,7 @@ where
                             } else {
                                 None
                             };
-                            let _ = writer.flush().await;
+                            let _ = flush_client_or_cancel(&mut writer, &flow_cancel_me_writer).await;
                             let flush_duration_us = flush_started_at.map(|started| {
                                 started
                                     .elapsed()
@@ -1317,6 +1408,7 @@ where
                             quota_limit,
                             d2c_flush_policy.quota_soft_overshoot_bytes,
                             traffic_lease_me_writer.as_ref(),
+                            &flow_cancel_me_writer,
                             bytes_me2c_clone.as_ref(),
                             conn_id,
                             d2c_flush_policy.ack_flush_immediate,
@@ -1338,7 +1430,8 @@ where
                                     } else {
                                         None
                                     };
-                                let _ = writer.flush().await;
+                                let _ =
+                                    flush_client_or_cancel(&mut writer, &flow_cancel_me_writer).await;
                                 let flush_duration_us = flush_started_at.map(|started| {
                                     started
                                         .elapsed()
@@ -1381,6 +1474,7 @@ where
                                     quota_limit,
                                     d2c_flush_policy.quota_soft_overshoot_bytes,
                                     traffic_lease_me_writer.as_ref(),
+                                    &flow_cancel_me_writer,
                                     bytes_me2c_clone.as_ref(),
                                     conn_id,
                                     d2c_flush_policy.ack_flush_immediate,
@@ -1405,7 +1499,11 @@ where
                                         } else {
                                             None
                                         };
-                                        let _ = writer.flush().await;
+                                        let _ = flush_client_or_cancel(
+                                            &mut writer,
+                                            &flow_cancel_me_writer,
+                                        )
+                                        .await;
                                         let flush_duration_us = flush_started_at.map(|started| {
                                             started
                                                 .elapsed()
@@ -1447,6 +1545,7 @@ where
                                         quota_limit,
                                         d2c_flush_policy.quota_soft_overshoot_bytes,
                                         traffic_lease_me_writer.as_ref(),
+                                        &flow_cancel_me_writer,
                                         bytes_me2c_clone.as_ref(),
                                         conn_id,
                                         d2c_flush_policy.ack_flush_immediate,
@@ -1471,7 +1570,11 @@ where
                                             } else {
                                                 None
                                             };
-                                            let _ = writer.flush().await;
+                                            let _ = flush_client_or_cancel(
+                                                &mut writer,
+                                                &flow_cancel_me_writer,
+                                            )
+                                            .await;
                                             let flush_duration_us = flush_started_at.map(|started| {
                                                 started
                                                     .elapsed()
@@ -1495,7 +1598,7 @@ where
                             Ok(None) => {
                                 debug!(conn_id, "ME channel closed");
                                 shrink_session_vec(&mut frame_buf, shrink_threshold);
-                                return Err(ProxyError::Proxy("ME connection lost".into()));
+                                return Err(ProxyError::MiddleConnectionLost);
                             }
                             Err(_) => {
                                 max_delay_fired = true;
@@ -1517,7 +1620,7 @@ where
                     } else {
                         None
                     };
-                    writer.flush().await.map_err(ProxyError::Io)?;
+                    flush_client_or_cancel(&mut writer, &flow_cancel_me_writer).await?;
                     let flush_duration_us = flush_started_at.map(|started| {
                         started
                             .elapsed()
@@ -1610,7 +1713,7 @@ where
                 stats.as_ref(),
             )
             .await;
-            main_result = Err(ProxyError::Proxy(ROUTE_SWITCH_ERROR_MSG.to_string()));
+            main_result = Err(ProxyError::RouteSwitched);
             break;
         }
 
@@ -1641,26 +1744,50 @@ where
                             traffic_lease.as_ref(),
                             RateDirection::Up,
                             payload.len() as u64,
+                            None,
                         )
-                        .await;
+                        .await?;
                         forensics.bytes_c2me = forensics
                             .bytes_c2me
                             .saturating_add(payload.len() as u64);
                         if let (Some(limit), Some(user_stats)) =
                             (quota_limit, quota_user_stats.as_deref())
                         {
-                            if reserve_user_quota_with_yield(
+                            match reserve_user_quota_with_yield(
                                 user_stats,
                                 payload.len() as u64,
                                 limit,
+                                stats.as_ref(),
+                                &flow_cancel,
+                                None,
                             )
                             .await
-                            .is_err()
                             {
-                                main_result = Err(ProxyError::DataQuotaExceeded {
-                                    user: user.clone(),
-                                });
-                                break;
+                                Ok(_) => {}
+                                Err(MiddleQuotaReserveError::LimitExceeded) => {
+                                    main_result = Err(ProxyError::DataQuotaExceeded {
+                                        user: user.clone(),
+                                    });
+                                    break;
+                                }
+                                Err(MiddleQuotaReserveError::Contended) => {
+                                    main_result = Err(ProxyError::Proxy(
+                                        "ME C->ME quota reservation contended".into(),
+                                    ));
+                                    break;
+                                }
+                                Err(MiddleQuotaReserveError::Cancelled) => {
+                                    main_result = Err(ProxyError::Proxy(
+                                        "ME C->ME quota reservation cancelled".into(),
+                                    ));
+                                    break;
+                                }
+                                Err(MiddleQuotaReserveError::DeadlineExceeded) => {
+                                    main_result = Err(ProxyError::Proxy(
+                                        "ME C->ME quota reservation deadline exceeded".into(),
+                                    ));
+                                    break;
+                                }
                             }
                             stats.add_user_octets_from_handle(user_stats, payload.len() as u64);
                         } else {
@@ -1729,22 +1856,34 @@ where
     }
 
     drop(c2me_tx);
-    let c2me_result = c2me_sender
-        .await
-        .unwrap_or_else(|e| Err(ProxyError::Proxy(format!("ME sender join error: {e}"))));
+    let c2me_result = match timeout(ME_CHILD_JOIN_TIMEOUT, &mut c2me_sender).await {
+        Ok(joined) => {
+            joined.unwrap_or_else(|e| Err(ProxyError::Proxy(format!("ME sender join error: {e}"))))
+        }
+        Err(_) => {
+            stats.increment_me_child_join_timeout_total();
+            stats.increment_me_child_abort_total();
+            c2me_sender.abort();
+            Err(ProxyError::Proxy("ME sender join timeout".into()))
+        }
+    };
 
+    flow_cancel.cancel();
     let _ = stop_tx.send(());
-    let mut writer_result = me_writer
-        .await
-        .unwrap_or_else(|e| Err(ProxyError::Proxy(format!("ME writer join error: {e}"))));
+    let mut writer_result = match timeout(ME_CHILD_JOIN_TIMEOUT, &mut me_writer).await {
+        Ok(joined) => {
+            joined.unwrap_or_else(|e| Err(ProxyError::Proxy(format!("ME writer join error: {e}"))))
+        }
+        Err(_) => {
+            stats.increment_me_child_join_timeout_total();
+            stats.increment_me_child_abort_total();
+            me_writer.abort();
+            Err(ProxyError::Proxy("ME writer join timeout".into()))
+        }
+    };
 
     // When client closes, but ME channel stopped as unregistered - it isnt error
-    if client_closed
-        && matches!(
-            writer_result,
-            Err(ProxyError::Proxy(ref msg)) if msg == "ME connection lost"
-        )
-    {
+    if client_closed && matches!(writer_result, Err(ProxyError::MiddleConnectionLost)) {
         writer_result = Ok(());
     }
 
@@ -2300,6 +2439,7 @@ where
         quota_limit,
         quota_soft_overshoot_bytes,
         None,
+        &CancellationToken::new(),
         bytes_me2c,
         conn_id,
         ack_flush_immediate,
@@ -2320,6 +2460,7 @@ async fn process_me_writer_response_with_traffic_lease<W>(
     quota_limit: Option<u64>,
     quota_soft_overshoot_bytes: u64,
     traffic_lease: Option<&Arc<TrafficLease>>,
+    cancel: &CancellationToken,
     bytes_me2c: &AtomicU64,
     conn_id: u64,
     ack_flush_immediate: bool,
@@ -2338,31 +2479,65 @@ where
             let data_len = data.len() as u64;
             if let (Some(limit), Some(user_stats)) = (quota_limit, quota_user_stats) {
                 let soft_limit = quota_soft_cap(limit, quota_soft_overshoot_bytes);
-                if reserve_user_quota_with_yield(user_stats, data_len, soft_limit)
-                    .await
-                    .is_err()
+                match reserve_user_quota_with_yield(
+                    user_stats, data_len, soft_limit, stats, cancel, None,
+                )
+                .await
                 {
-                    stats.increment_me_d2c_quota_reject_total(MeD2cQuotaRejectStage::PreWrite);
-                    return Err(ProxyError::DataQuotaExceeded {
-                        user: user.to_string(),
-                    });
+                    Ok(_) => {}
+                    Err(MiddleQuotaReserveError::LimitExceeded) => {
+                        stats.increment_me_d2c_quota_reject_total(MeD2cQuotaRejectStage::PreWrite);
+                        return Err(ProxyError::DataQuotaExceeded {
+                            user: user.to_string(),
+                        });
+                    }
+                    Err(MiddleQuotaReserveError::Contended) => {
+                        return Err(ProxyError::Proxy(
+                            "ME D->C quota reservation contended".into(),
+                        ));
+                    }
+                    Err(MiddleQuotaReserveError::Cancelled) => {
+                        return Err(ProxyError::Proxy(
+                            "ME D->C quota reservation cancelled".into(),
+                        ));
+                    }
+                    Err(MiddleQuotaReserveError::DeadlineExceeded) => {
+                        return Err(ProxyError::Proxy(
+                            "ME D->C quota reservation deadline exceeded".into(),
+                        ));
+                    }
                 }
             }
-            wait_for_traffic_budget(traffic_lease, RateDirection::Down, data_len).await;
+            wait_for_traffic_budget_or_cancel(
+                traffic_lease,
+                RateDirection::Down,
+                data_len,
+                cancel,
+                stats,
+                None,
+            )
+            .await?;
 
-            let write_mode =
-                match write_client_payload(client_writer, proto_tag, flags, &data, rng, frame_buf)
-                    .await
-                {
-                    Ok(mode) => mode,
-                    Err(err) => {
-                        if quota_limit.is_some() {
-                            stats.add_quota_write_fail_bytes_total(data_len);
-                            stats.increment_quota_write_fail_events_total();
-                        }
-                        return Err(err);
+            let write_mode = match write_client_payload(
+                client_writer,
+                proto_tag,
+                flags,
+                &data,
+                rng,
+                frame_buf,
+                cancel,
+            )
+            .await
+            {
+                Ok(mode) => mode,
+                Err(err) => {
+                    if quota_limit.is_some() {
+                        stats.add_quota_write_fail_bytes_total(data_len);
+                        stats.increment_quota_write_fail_events_total();
                     }
-                };
+                    return Err(err);
+                }
+            };
 
             bytes_me2c.fetch_add(data_len, Ordering::Relaxed);
             if let Some(user_stats) = quota_user_stats {
@@ -2386,8 +2561,16 @@ where
             } else {
                 trace!(conn_id, confirm, "ME->C quickack");
             }
-            wait_for_traffic_budget(traffic_lease, RateDirection::Down, 4).await;
-            write_client_ack(client_writer, proto_tag, confirm).await?;
+            wait_for_traffic_budget_or_cancel(
+                traffic_lease,
+                RateDirection::Down,
+                4,
+                cancel,
+                stats,
+                None,
+            )
+            .await?;
+            write_client_ack(client_writer, proto_tag, confirm, cancel).await?;
             stats.increment_me_d2c_ack_frames_total();
 
             Ok(MeWriterResponseOutcome::Continue {
@@ -2439,6 +2622,7 @@ async fn write_client_payload<W>(
     data: &[u8],
     rng: &SecureRandom,
     frame_buf: &mut Vec<u8>,
+    cancel: &CancellationToken,
 ) -> Result<MeD2cWriteMode>
 where
     W: AsyncWrite + Unpin + Send + 'static,
@@ -2466,21 +2650,12 @@ where
                     frame_buf.reserve(wire_len);
                     frame_buf.push(first);
                     frame_buf.extend_from_slice(data);
-                    client_writer
-                        .write_all(frame_buf.as_slice())
-                        .await
-                        .map_err(ProxyError::Io)?;
+                    write_all_client_or_cancel(client_writer, frame_buf.as_slice(), cancel).await?;
                     MeD2cWriteMode::Coalesced
                 } else {
                     let header = [first];
-                    client_writer
-                        .write_all(&header)
-                        .await
-                        .map_err(ProxyError::Io)?;
-                    client_writer
-                        .write_all(data)
-                        .await
-                        .map_err(ProxyError::Io)?;
+                    write_all_client_or_cancel(client_writer, &header, cancel).await?;
+                    write_all_client_or_cancel(client_writer, data, cancel).await?;
                     MeD2cWriteMode::Split
                 }
             } else if len_words < (1 << 24) {
@@ -2495,21 +2670,12 @@ where
                     frame_buf.reserve(wire_len);
                     frame_buf.extend_from_slice(&[first, lw[0], lw[1], lw[2]]);
                     frame_buf.extend_from_slice(data);
-                    client_writer
-                        .write_all(frame_buf.as_slice())
-                        .await
-                        .map_err(ProxyError::Io)?;
+                    write_all_client_or_cancel(client_writer, frame_buf.as_slice(), cancel).await?;
                     MeD2cWriteMode::Coalesced
                 } else {
                     let header = [first, lw[0], lw[1], lw[2]];
-                    client_writer
-                        .write_all(&header)
-                        .await
-                        .map_err(ProxyError::Io)?;
-                    client_writer
-                        .write_all(data)
-                        .await
-                        .map_err(ProxyError::Io)?;
+                    write_all_client_or_cancel(client_writer, &header, cancel).await?;
+                    write_all_client_or_cancel(client_writer, data, cancel).await?;
                     MeD2cWriteMode::Split
                 }
             } else {
@@ -2544,21 +2710,12 @@ where
                     frame_buf.resize(start + padding_len, 0);
                     rng.fill(&mut frame_buf[start..]);
                 }
-                client_writer
-                    .write_all(frame_buf.as_slice())
-                    .await
-                    .map_err(ProxyError::Io)?;
+                write_all_client_or_cancel(client_writer, frame_buf.as_slice(), cancel).await?;
                 MeD2cWriteMode::Coalesced
             } else {
                 let header = len_val.to_le_bytes();
-                client_writer
-                    .write_all(&header)
-                    .await
-                    .map_err(ProxyError::Io)?;
-                client_writer
-                    .write_all(data)
-                    .await
-                    .map_err(ProxyError::Io)?;
+                write_all_client_or_cancel(client_writer, &header, cancel).await?;
+                write_all_client_or_cancel(client_writer, data, cancel).await?;
                 if padding_len > 0 {
                     frame_buf.clear();
                     if frame_buf.capacity() < padding_len {
@@ -2566,10 +2723,7 @@ where
                     }
                     frame_buf.resize(padding_len, 0);
                     rng.fill(frame_buf.as_mut_slice());
-                    client_writer
-                        .write_all(frame_buf.as_slice())
-                        .await
-                        .map_err(ProxyError::Io)?;
+                    write_all_client_or_cancel(client_writer, frame_buf.as_slice(), cancel).await?;
                 }
                 MeD2cWriteMode::Split
             }
@@ -2583,6 +2737,7 @@ async fn write_client_ack<W>(
     client_writer: &mut CryptoWriter<W>,
     proto_tag: ProtoTag,
     confirm: u32,
+    cancel: &CancellationToken,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin + Send + 'static,
@@ -2592,10 +2747,34 @@ where
     } else {
         confirm.to_le_bytes()
     };
-    client_writer
-        .write_all(&bytes)
-        .await
-        .map_err(ProxyError::Io)
+    write_all_client_or_cancel(client_writer, &bytes, cancel).await
+}
+
+async fn write_all_client_or_cancel<W>(
+    client_writer: &mut CryptoWriter<W>,
+    bytes: &[u8],
+    cancel: &CancellationToken,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::select! {
+        result = client_writer.write_all(bytes) => result.map_err(ProxyError::Io),
+        _ = cancel.cancelled() => Err(ProxyError::MiddleClientWriterCancelled),
+    }
+}
+
+async fn flush_client_or_cancel<W>(
+    client_writer: &mut CryptoWriter<W>,
+    cancel: &CancellationToken,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::select! {
+        result = client_writer.flush() => result.map_err(ProxyError::Io),
+        _ = cancel.cancelled() => Err(ProxyError::MiddleClientWriterCancelled),
+    }
 }
 
 #[cfg(test)]

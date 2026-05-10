@@ -18,8 +18,7 @@ use crate::error::{ProxyError, Result};
 use crate::protocol::constants::*;
 use crate::proxy::handshake::{HandshakeSuccess, encrypt_tg_nonce_with_ciphers, generate_tg_nonce};
 use crate::proxy::route_mode::{
-    ROUTE_SWITCH_ERROR_MSG, RelayRouteMode, RouteCutoverState, affected_cutover_state,
-    cutover_stagger_delay,
+    RelayRouteMode, RouteCutoverState, affected_cutover_state, cutover_stagger_delay,
 };
 use crate::proxy::shared_state::{
     ConntrackCloseEvent, ConntrackClosePublishResult, ConntrackCloseReason, ProxySharedState,
@@ -360,7 +359,7 @@ where
                 "Cutover affected direct session, closing client connection"
             );
             tokio::time::sleep(delay).await;
-            break Err(ProxyError::Proxy(ROUTE_SWITCH_ERROR_MSG.to_string()));
+            break Err(ProxyError::RouteSwitched);
         }
         tokio::select! {
             result = &mut relay_result => {

@@ -1450,6 +1450,20 @@ where
         validated_secret.copy_from_slice(secret);
     }
 
+    if config
+        .access
+        .is_user_source_ip_denied(validated_user.as_str(), peer.ip())
+    {
+        auth_probe_record_failure_in(shared, peer.ip(), Instant::now());
+        maybe_apply_server_hello_delay(config).await;
+        warn!(
+            peer = %peer,
+            user = %validated_user,
+            "TLS handshake rejected: client source IP on per-user deny list (access.user_source_deny)"
+        );
+        return HandshakeResult::BadClient { reader, writer };
+    }
+
     // Reject known replay digests before expensive cache/domain/ALPN policy work.
     let digest_half = &validation_digest[..tls::TLS_DIGEST_HALF_LEN];
     if replay_checker.check_tls_digest(digest_half) {
@@ -1795,6 +1809,20 @@ where
 
         let validation = matched_validation.expect("validation must exist when matched");
 
+        if config
+            .access
+            .is_user_source_ip_denied(matched_user.as_str(), peer.ip())
+        {
+            auth_probe_record_failure_in(shared, peer.ip(), Instant::now());
+            maybe_apply_server_hello_delay(config).await;
+            warn!(
+                peer = %peer,
+                user = %matched_user,
+                "MTProto handshake rejected: client source IP on per-user deny list (access.user_source_deny)"
+            );
+            return HandshakeResult::BadClient { reader, writer };
+        }
+
         // Apply replay tracking only after successful authentication.
         //
         // This ordering prevents an attacker from producing invalid handshakes that
@@ -1872,6 +1900,20 @@ where
                 .handshake
                 .auth_expensive_checks_total
                 .fetch_add(validation_checks as u64, Ordering::Relaxed);
+
+            if config
+                .access
+                .is_user_source_ip_denied(user.as_str(), peer.ip())
+            {
+                auth_probe_record_failure_in(shared, peer.ip(), Instant::now());
+                maybe_apply_server_hello_delay(config).await;
+                warn!(
+                    peer = %peer,
+                    user = %user,
+                    "MTProto handshake rejected: client source IP on per-user deny list (access.user_source_deny)"
+                );
+                return HandshakeResult::BadClient { reader, writer };
+            }
 
             // Apply replay tracking only after successful authentication.
             //

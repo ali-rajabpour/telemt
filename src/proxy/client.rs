@@ -32,7 +32,13 @@ struct UserConnectionReservation {
     user: String,
     ip: IpAddr,
     tracks_ip: bool,
-    active: bool,
+    state: SessionReservationState,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionReservationState {
+    Active,
+    Released,
 }
 
 impl UserConnectionReservation {
@@ -49,28 +55,35 @@ impl UserConnectionReservation {
             user,
             ip,
             tracks_ip,
-            active: true,
+            state: SessionReservationState::Active,
         }
     }
 
+    fn mark_released(&mut self) -> bool {
+        if self.state != SessionReservationState::Active {
+            return false;
+        }
+        self.state = SessionReservationState::Released;
+        true
+    }
+
     async fn release(mut self) {
-        if !self.active {
+        if !self.mark_released() {
             return;
         }
         if self.tracks_ip {
             self.ip_tracker.remove_ip(&self.user, self.ip).await;
         }
-        self.active = false;
         self.stats.decrement_user_curr_connects(&self.user);
     }
 }
 
 impl Drop for UserConnectionReservation {
     fn drop(&mut self) {
-        if !self.active {
+        if !self.mark_released() {
             return;
         }
-        self.active = false;
+        self.stats.increment_session_drop_fallback_total();
         self.stats.decrement_user_curr_connects(&self.user);
         if self.tracks_ip {
             self.ip_tracker.enqueue_cleanup(self.user.clone(), self.ip);
@@ -466,6 +479,17 @@ where
     let mut local_addr = synthetic_local_addr(config.server.port);
 
     if proxy_protocol_enabled {
+        if !is_trusted_proxy_source(peer.ip(), &config.server.proxy_protocol_trusted_cidrs) {
+            stats.increment_connects_bad_with_class("proxy_protocol_untrusted");
+            warn!(
+                peer = %peer,
+                trusted = ?config.server.proxy_protocol_trusted_cidrs,
+                "Rejecting PROXY protocol header from untrusted source"
+            );
+            record_beobachten_class(&beobachten, &config, peer.ip(), "other");
+            return Err(ProxyError::InvalidProxyProtocol);
+        }
+
         let proxy_header_timeout =
             Duration::from_millis(config.server.proxy_protocol_header_timeout_ms.max(1));
         match timeout(
@@ -475,17 +499,6 @@ where
         .await
         {
             Ok(Ok(info)) => {
-                if !is_trusted_proxy_source(peer.ip(), &config.server.proxy_protocol_trusted_cidrs)
-                {
-                    stats.increment_connects_bad_with_class("proxy_protocol_untrusted");
-                    warn!(
-                        peer = %peer,
-                        trusted = ?config.server.proxy_protocol_trusted_cidrs,
-                        "Rejecting PROXY protocol header from untrusted source"
-                    );
-                    record_beobachten_class(&beobachten, &config, peer.ip(), "other");
-                    return Err(ProxyError::InvalidProxyProtocol);
-                }
                 debug!(
                     peer = %peer,
                     client = %info.src_addr,
@@ -978,6 +991,21 @@ impl RunningClientHandler {
         let mut local_addr = self.stream.local_addr().map_err(ProxyError::Io)?;
 
         if self.proxy_protocol_enabled {
+            if !is_trusted_proxy_source(
+                self.peer.ip(),
+                &self.config.server.proxy_protocol_trusted_cidrs,
+            ) {
+                self.stats
+                    .increment_connects_bad_with_class("proxy_protocol_untrusted");
+                warn!(
+                    peer = %self.peer,
+                    trusted = ?self.config.server.proxy_protocol_trusted_cidrs,
+                    "Rejecting PROXY protocol header from untrusted source"
+                );
+                record_beobachten_class(&self.beobachten, &self.config, self.peer.ip(), "other");
+                return Err(ProxyError::InvalidProxyProtocol);
+            }
+
             let proxy_header_timeout =
                 Duration::from_millis(self.config.server.proxy_protocol_header_timeout_ms.max(1));
             match timeout(
@@ -987,25 +1015,6 @@ impl RunningClientHandler {
             .await
             {
                 Ok(Ok(info)) => {
-                    if !is_trusted_proxy_source(
-                        self.peer.ip(),
-                        &self.config.server.proxy_protocol_trusted_cidrs,
-                    ) {
-                        self.stats
-                            .increment_connects_bad_with_class("proxy_protocol_untrusted");
-                        warn!(
-                            peer = %self.peer,
-                            trusted = ?self.config.server.proxy_protocol_trusted_cidrs,
-                            "Rejecting PROXY protocol header from untrusted source"
-                        );
-                        record_beobachten_class(
-                            &self.beobachten,
-                            &self.config,
-                            self.peer.ip(),
-                            "other",
-                        );
-                        return Err(ProxyError::InvalidProxyProtocol);
-                    }
                     debug!(
                         peer = %self.peer,
                         client = %info.src_addr,
