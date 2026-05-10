@@ -23,8 +23,7 @@ use crate::error::{ProxyError, Result};
 use crate::protocol::constants::{secure_padding_len, *};
 use crate::proxy::handshake::HandshakeSuccess;
 use crate::proxy::route_mode::{
-    ROUTE_SWITCH_ERROR_MSG, RelayRouteMode, RouteCutoverState, affected_cutover_state,
-    cutover_stagger_delay,
+    RelayRouteMode, RouteCutoverState, affected_cutover_state, cutover_stagger_delay,
 };
 use crate::proxy::shared_state::{
     ConntrackCloseEvent, ConntrackClosePublishResult, ConntrackCloseReason, ProxySharedState,
@@ -1188,7 +1187,7 @@ where
         tokio::time::sleep(delay).await;
         let _ = me_pool.send_close(conn_id).await;
         me_pool.registry().unregister(conn_id).await;
-        return Err(ProxyError::Proxy(ROUTE_SWITCH_ERROR_MSG.to_string()));
+        return Err(ProxyError::RouteSwitched);
     }
 
     // Per-user ad_tag from access.user_ad_tags; fallback to general.ad_tag (hot-reloadable)
@@ -1690,7 +1689,7 @@ where
                 stats.as_ref(),
             )
             .await;
-            main_result = Err(ProxyError::Proxy(ROUTE_SWITCH_ERROR_MSG.to_string()));
+            main_result = Err(ProxyError::RouteSwitched);
             break;
         }
 

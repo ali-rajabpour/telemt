@@ -78,6 +78,11 @@ pub(crate) async fn spawn_runtime_tasks(
         stats_maintenance.run_periodic_user_stats_maintenance().await;
     });
 
+    let ip_tracker_maintenance = ip_tracker.clone();
+    tokio::spawn(async move {
+        ip_tracker_maintenance.run_periodic_maintenance().await;
+    });
+
     let detected_ip_v4: Option<IpAddr> = probe.detected_ipv4.map(IpAddr::V4);
     let detected_ip_v6: Option<IpAddr> = probe.detected_ipv6.map(IpAddr::V6);
     debug!(

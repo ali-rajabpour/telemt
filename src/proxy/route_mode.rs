@@ -4,8 +4,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::watch;
 
-pub(crate) const ROUTE_SWITCH_ERROR_MSG: &str = "Session terminated";
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum RelayRouteMode {

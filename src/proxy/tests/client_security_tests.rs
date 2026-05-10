@@ -661,7 +661,7 @@ async fn integration_route_cutover_and_quota_overlap_fails_closed_and_releases_s
 
     assert!(
         matches!(relay_result, Err(ProxyError::DataQuotaExceeded { .. }))
-            || matches!(relay_result, Err(ProxyError::Proxy(ref msg)) if msg == crate::proxy::route_mode::ROUTE_SWITCH_ERROR_MSG),
+            || matches!(relay_result, Err(ProxyError::RouteSwitched)),
         "overlap race must fail closed via quota enforcement or generic cutover termination"
     );
 
