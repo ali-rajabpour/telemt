@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tracing::{debug, warn};
 
@@ -33,6 +34,11 @@ mod close;
 mod recovery;
 mod selection;
 
+enum WriterCommandReserveError {
+    Closed,
+    TimedOut,
+}
+
 fn proxy_tag_array(tag: Option<&[u8]>) -> Option<[u8; 16]> {
     tag.and_then(|tag| <[u8; 16]>::try_from(tag).ok())
 }
@@ -41,6 +47,21 @@ fn proxy_req_payload_from_command(cmd: WriterCommand) -> Option<PooledBuffer> {
     match cmd {
         WriterCommand::ProxyReq(command) => Some(command.payload),
         _ => None,
+    }
+}
+
+async fn reserve_writer_command_slot(
+    tx: &mpsc::Sender<WriterCommand>,
+    wait: Option<Duration>,
+) -> std::result::Result<mpsc::OwnedPermit<WriterCommand>, WriterCommandReserveError> {
+    let reserve = tx.clone().reserve_owned();
+    match wait {
+        Some(wait) => match tokio::time::timeout(wait, reserve).await {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(_)) => Err(WriterCommandReserveError::Closed),
+            Err(_) => Err(WriterCommandReserveError::TimedOut),
+        },
+        None => reserve.await.map_err(|_| WriterCommandReserveError::Closed),
     }
 }
 
@@ -104,9 +125,25 @@ impl MePool {
                         return Ok(());
                     }
                     Err(TrySendError::Full(cmd)) => {
-                        if current.tx.send(cmd).await.is_ok() {
-                            self.note_hybrid_route_success();
-                            return Ok(());
+                        match reserve_writer_command_slot(
+                            &current.tx,
+                            self.route_runtime.me_route_blocking_send_timeout,
+                        )
+                        .await
+                        {
+                            Ok(permit) => {
+                                permit.send(cmd);
+                                self.note_hybrid_route_success();
+                                return Ok(());
+                            }
+                            Err(WriterCommandReserveError::TimedOut) => {
+                                self.stats
+                                    .increment_me_writer_pick_full_total(self.writer_pick_mode());
+                                return Err(ProxyError::Proxy(
+                                    "ME writer channel full within blocking send timeout".into(),
+                                ));
+                            }
+                            Err(WriterCommandReserveError::Closed) => {}
                         }
                         warn!(writer_id = current.writer_id, "ME writer channel closed");
                         self.remove_writer_and_close_clients(current.writer_id)
@@ -156,11 +193,7 @@ impl MePool {
                                     for (dc, addrs) in preferred.iter() {
                                         for addr in addrs {
                                             let _ = self
-                                                .connect_one_for_dc(
-                                                    *addr,
-                                                    *dc,
-                                                    self.rng.as_ref(),
-                                                )
+                                                .connect_one_for_dc(*addr, *dc, self.rng.as_ref())
                                                 .await;
                                         }
                                     }
@@ -558,33 +591,48 @@ impl MePool {
                     self.note_hybrid_route_success();
                     return Ok(());
                 }
-                Err(TrySendError::Full(cmd)) => match current.tx.send(cmd).await {
-                    Ok(()) => {
-                        self.note_hybrid_route_success();
-                        return Ok(());
-                    }
-                    Err(send_err) => {
-                        let Some(payload) = proxy_req_payload_from_command(send_err.0) else {
+                Err(TrySendError::Full(cmd)) => {
+                    match reserve_writer_command_slot(
+                        &current.tx,
+                        self.route_runtime.me_route_blocking_send_timeout,
+                    )
+                    .await
+                    {
+                        Ok(permit) => {
+                            permit.send(cmd);
+                            self.note_hybrid_route_success();
+                            return Ok(());
+                        }
+                        Err(WriterCommandReserveError::TimedOut) => {
+                            self.stats
+                                .increment_me_writer_pick_full_total(self.writer_pick_mode());
                             return Err(ProxyError::Proxy(
-                                "ME writer rejected unexpected command type".into(),
+                                "ME writer channel full within blocking send timeout".into(),
                             ));
-                        };
-                        warn!(writer_id = current.writer_id, "ME writer channel closed");
-                        self.remove_writer_and_close_clients(current.writer_id)
-                            .await;
-                        return self
-                            .send_proxy_req(
-                                conn_id,
-                                target_dc,
-                                client_addr,
-                                our_addr,
-                                payload.as_ref(),
-                                proto_flags,
-                                tag.as_ref().map(|tag| tag.as_slice()),
-                            )
-                            .await;
+                        }
+                        Err(WriterCommandReserveError::Closed) => {
+                            let Some(payload) = proxy_req_payload_from_command(cmd) else {
+                                return Err(ProxyError::Proxy(
+                                    "ME writer rejected unexpected command type".into(),
+                                ));
+                            };
+                            warn!(writer_id = current.writer_id, "ME writer channel closed");
+                            self.remove_writer_and_close_clients(current.writer_id)
+                                .await;
+                            return self
+                                .send_proxy_req(
+                                    conn_id,
+                                    target_dc,
+                                    client_addr,
+                                    our_addr,
+                                    payload.as_ref(),
+                                    proto_flags,
+                                    tag.as_ref().map(|tag| tag.as_slice()),
+                                )
+                                .await;
+                        }
                     }
-                },
+                }
                 Err(TrySendError::Closed(cmd)) => {
                     let Some(payload) = proxy_req_payload_from_command(cmd) else {
                         return Err(ProxyError::Proxy(

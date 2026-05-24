@@ -44,7 +44,10 @@ pub(super) fn mark_relay_idle_candidate_in(shared: &ProxySharedState, conn_id: u
         dashmap::mapref::entry::Entry::Occupied(_) => false,
         dashmap::mapref::entry::Entry::Vacant(entry) => {
             entry.insert(meta);
-            registry.ordered.lock().insert((meta.mark_order_seq, conn_id));
+            registry
+                .ordered
+                .lock()
+                .insert((meta.mark_order_seq, conn_id));
             true
         }
     }
@@ -123,7 +126,11 @@ pub(super) fn maybe_evict_idle_candidate_on_pressure_in(
         return false;
     }
 
-    let Some(candidate_meta) = registry.by_conn_id.get(&conn_id).map(|entry| *entry.value()) else {
+    let Some(candidate_meta) = registry
+        .by_conn_id
+        .get(&conn_id)
+        .map(|entry| *entry.value())
+    else {
         return false;
     };
 

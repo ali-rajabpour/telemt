@@ -14,7 +14,9 @@ use super::{
 
 impl ConnRegistry {
     fn set_writer_bound_count(&self, writer_id: u64, count: usize) {
-        self.binding.bound_clients_by_writer.insert(writer_id, count);
+        self.binding
+            .bound_clients_by_writer
+            .insert(writer_id, count);
         if count == 0 {
             self.binding
                 .writer_idle_since_epoch_secs
@@ -38,8 +40,11 @@ impl ConnRegistry {
             return;
         }
 
-        let remove =
-            if let Some(mut count) = self.binding.active_sessions_by_target_dc.get_mut(&target_dc) {
+        let remove = if let Some(mut count) = self
+            .binding
+            .active_sessions_by_target_dc
+            .get_mut(&target_dc)
+        {
             let decrement = delta.unsigned_abs();
             *count = count.saturating_sub(decrement);
             *count == 0
@@ -57,7 +62,10 @@ impl ConnRegistry {
             .conns_for_writer
             .entry(writer_id)
             .or_insert_with(HashSet::new);
-        self.binding.bound_clients_by_writer.entry(writer_id).or_insert(0);
+        self.binding
+            .bound_clients_by_writer
+            .entry(writer_id)
+            .or_insert(0);
         self.binding
             .writer_idle_since_epoch_secs
             .entry(writer_id)
@@ -474,10 +482,7 @@ impl ConnRegistry {
                 self.hot_binding.map.remove(&conn_id);
             }
             if let Some(m) = meta {
-                out.push(BoundConn {
-                    conn_id,
-                    meta: m,
-                });
+                out.push(BoundConn { conn_id, meta: m });
             }
         }
         out
