@@ -1558,6 +1558,11 @@ impl RunningClientHandler {
     {
         let user = success.user.clone();
 
+        if !shared.is_user_enabled(&user) {
+            warn!(user = %user, "Disabled user rejected");
+            return Err(ProxyError::UserDisabled { user });
+        }
+
         let user_limit_reservation = match Self::acquire_user_connection_reservation_static(
             &user,
             &config,
@@ -1576,6 +1581,8 @@ impl RunningClientHandler {
 
         let route_snapshot = route_runtime.snapshot();
         let session_id = rng.u64();
+        let _user_session = shared.register_user_session(&user, session_id);
+        let session_cancel = _user_session.token();
         let selected_me_pool = if config.general.use_middle_proxy
             && matches!(route_snapshot.mode, RelayRouteMode::Middle)
         {
@@ -1607,6 +1614,7 @@ impl RunningClientHandler {
                     route_runtime.subscribe(),
                     route_snapshot,
                     session_id,
+                    session_cancel.clone(),
                     shared.clone(),
                 )
                 .await
@@ -1625,6 +1633,7 @@ impl RunningClientHandler {
                     route_snapshot,
                     session_id,
                     local_addr,
+                    session_cancel.clone(),
                     shared.clone(),
                 )
                 .await
@@ -1644,6 +1653,7 @@ impl RunningClientHandler {
                 route_snapshot,
                 session_id,
                 local_addr,
+                session_cancel,
                 shared.clone(),
             )
             .await

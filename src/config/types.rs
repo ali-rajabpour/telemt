@@ -1892,6 +1892,9 @@ pub struct AccessConfig {
     #[serde(default = "default_access_users")]
     pub users: HashMap<String, String>,
 
+    #[serde(default)]
+    pub user_enabled: HashMap<String, bool>,
+
     /// Per-user ad_tag (32 hex chars from @MTProxybot).
     #[serde(default)]
     pub user_ad_tags: HashMap<String, String>,
@@ -1963,6 +1966,7 @@ impl Default for AccessConfig {
     fn default() -> Self {
         Self {
             users: default_access_users(),
+            user_enabled: HashMap::new(),
             user_ad_tags: HashMap::new(),
             user_max_tcp_conns: HashMap::new(),
             user_max_tcp_conns_global_each: default_user_max_tcp_conns_global_each(),
@@ -1983,6 +1987,10 @@ impl Default for AccessConfig {
 }
 
 impl AccessConfig {
+    pub fn is_user_enabled(&self, username: &str) -> bool {
+        self.user_enabled.get(username).copied().unwrap_or(true)
+    }
+
     /// Returns true if `ip` is contained in any CIDR listed for `username` under `user_source_deny`.
     pub fn is_user_source_ip_denied(&self, username: &str, ip: IpAddr) -> bool {
         self.user_source_deny

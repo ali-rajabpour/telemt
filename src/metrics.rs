@@ -55,8 +55,10 @@ pub async fn serve(
                 return;
             }
         };
-        let is_ipv6 = addr.is_ipv6();
-        match bind_metrics_listener(addr, is_ipv6, listen_backlog) {
+        // Match `server.api.listen`: `[::]:port` is a dual-stack wildcard
+        // on Linux when `net.ipv6.bindv6only=0`.
+        let ipv6_only = addr.is_ipv6() && !addr.ip().is_unspecified();
+        match bind_metrics_listener(addr, ipv6_only, listen_backlog) {
             Ok(listener) => {
                 info!("Metrics endpoint: http://{}/metrics and /beobachten", addr);
                 serve_listener(
