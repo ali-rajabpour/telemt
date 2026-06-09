@@ -2834,6 +2834,7 @@ dependencies = [
  "socket2",
  "static_assertions",
  "subtle",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-rustls",

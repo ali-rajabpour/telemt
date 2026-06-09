@@ -28,6 +28,7 @@ use crate::stats::Stats;
 use crate::transport::UpstreamManager;
 use crate::transport::middle_proxy::MePool;
 
+mod config_edit;
 mod config_store;
 mod events;
 mod http_utils;
@@ -84,6 +85,7 @@ const ALLOW_GET: &str = "GET";
 const ALLOW_POST: &str = "POST";
 const ALLOW_GET_POST: &str = "GET, POST";
 const ALLOW_GET_PATCH_DELETE: &str = "GET, PATCH, DELETE";
+const ALLOW_GET_PATCH: &str = "GET, PATCH";
 
 pub(super) struct ApiRuntimeState {
     pub(super) process_started_at_epoch_secs: u64,
@@ -174,6 +176,7 @@ fn allowed_methods_for_path(path: &str) -> Option<&'static str> {
         | "/v1/stats/users/quota"
         | "/v1/stats/users" => Some(ALLOW_GET),
         "/v1/users" => Some(ALLOW_GET_POST),
+        "/v1/config" => Some(ALLOW_GET_PATCH),
         _ if user_action_route_matches(path, "/reset-quota") => Some(ALLOW_POST),
         _ if user_action_route_matches(path, "/rotate-secret") => Some(ALLOW_POST),
         _ if user_action_route_matches(path, "/enable") => Some(ALLOW_POST),
@@ -642,6 +645,37 @@ async fn handle(
                     StatusCode::ACCEPTED
                 };
                 Ok(success_response(status, data, revision))
+            }
+            ("GET", "/v1/config") => {
+                let (value, revision) =
+                    config_edit::read_managed_config(&shared.config_path).await?;
+                Ok(success_response(StatusCode::OK, value, revision))
+            }
+            ("PATCH", "/v1/config") => {
+                if api_cfg.read_only {
+                    return Ok(error_response(
+                        request_id,
+                        ApiFailure::new(
+                            StatusCode::FORBIDDEN,
+                            "read_only",
+                            "API runs in read-only mode",
+                        ),
+                    ));
+                }
+                let expected_revision = parse_if_match(req.headers());
+                let body = read_json::<serde_json::Value>(req.into_body(), body_limit).await?;
+                match config_edit::patch_config(body, expected_revision, &shared).await {
+                    Ok(resp) => {
+                        let revision = resp.revision.clone();
+                        Ok(success_response(StatusCode::OK, resp, revision))
+                    }
+                    Err(error) => {
+                        shared
+                            .runtime_events
+                            .record("api.config.patch.failed", error.code);
+                        Err(error)
+                    }
+                }
             }
             _ => {
                 if method == Method::POST
