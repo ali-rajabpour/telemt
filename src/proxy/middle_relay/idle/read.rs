@@ -236,10 +236,10 @@ where
                     }
                     Err(e) => return Err(e),
                 }
-                let quickack = (len_buf[3] & 0x80) != 0;
+                let header = crate::protocol::framing::parse_intermediate_header(len_buf);
                 (
-                    (u32::from_le_bytes(len_buf) & 0x7fff_ffff) as usize,
-                    quickack,
+                    header.wire_len,
+                    header.quickack,
                     Some(len_buf),
                 )
             }

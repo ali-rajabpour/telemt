@@ -5,6 +5,9 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use crate::crypto::SecureRandom;
+use crate::protocol::framing::{
+    secure_version_d_body_len_from_wire_len, secure_version_d_padding_len,
+};
 use std::sync::LazyLock;
 
 // ============= Telegram Datacenters =============
@@ -239,10 +242,7 @@ pub fn is_valid_secure_payload_len(data_len: usize) -> bool {
 /// Secure mode cannot distinguish full-word padding from payload, so only the
 /// non-aligned tail bytes are stripped.
 pub fn secure_payload_len_from_wire_len(wire_len: usize) -> Option<usize> {
-    if wire_len < 4 {
-        return None;
-    }
-    Some(wire_len - (wire_len % 4))
+    secure_version_d_body_len_from_wire_len(wire_len)
 }
 
 /// Generate padding length for Secure Intermediate protocol.
@@ -252,7 +252,7 @@ pub fn secure_padding_len(data_len: usize, rng: &SecureRandom) -> usize {
         is_valid_secure_payload_len(data_len),
         "Secure payload must be 4-byte aligned, got {data_len}"
     );
-    rng.range(16)
+    secure_version_d_padding_len(rng)
 }
 
 // ============= Timeouts =============

@@ -15,6 +15,7 @@ use crate::crypto::SecureRandom;
 use crate::protocol::constants::{
     ProtoTag, is_valid_secure_payload_len, secure_padding_len, secure_payload_len_from_wire_len,
 };
+use crate::protocol::framing::{encode_intermediate_header, parse_intermediate_header};
 
 // ============= Unified Codec =============
 
@@ -197,13 +198,9 @@ fn decode_intermediate(src: &mut BytesMut, max_size: usize) -> io::Result<Option
     }
 
     let mut meta = FrameMeta::new();
-    let mut len = u32::from_le_bytes([src[0], src[1], src[2], src[3]]) as usize;
-
-    // Check QuickACK flag
-    if len >= 0x80000000 {
-        meta.quickack = true;
-        len -= 0x80000000;
-    }
+    let header = parse_intermediate_header([src[0], src[1], src[2], src[3]]);
+    let len = header.wire_len;
+    meta.quickack = header.quickack;
 
     // Validate size
     if len > max_size {
@@ -239,10 +236,12 @@ fn encode_intermediate(frame: &Frame, dst: &mut BytesMut) -> io::Result<()> {
 
     dst.reserve(4 + data.len());
 
-    let mut len = data.len() as u32;
-    if frame.meta.quickack {
-        len |= 0x80000000;
-    }
+    let len = encode_intermediate_header(data.len(), frame.meta.quickack).ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            format!("frame too large: {} bytes", data.len()),
+        )
+    })?;
 
     dst.extend_from_slice(&len.to_le_bytes());
     dst.extend_from_slice(data);
@@ -258,13 +257,9 @@ fn decode_secure(src: &mut BytesMut, max_size: usize) -> io::Result<Option<Frame
     }
 
     let mut meta = FrameMeta::new();
-    let mut len = u32::from_le_bytes([src[0], src[1], src[2], src[3]]) as usize;
-
-    // Check QuickACK flag
-    if len >= 0x80000000 {
-        meta.quickack = true;
-        len -= 0x80000000;
-    }
+    let header = parse_intermediate_header([src[0], src[1], src[2], src[3]]);
+    let len = header.wire_len;
+    meta.quickack = header.quickack;
 
     // Validate size
     if len > max_size {
@@ -323,10 +318,12 @@ fn encode_secure(frame: &Frame, dst: &mut BytesMut, rng: &SecureRandom) -> io::R
     let total_len = data.len() + padding_len;
     dst.reserve(4 + total_len);
 
-    let mut len = total_len as u32;
-    if frame.meta.quickack {
-        len |= 0x80000000;
-    }
+    let len = encode_intermediate_header(total_len, frame.meta.quickack).ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            format!("frame too large: {} bytes", total_len),
+        )
+    })?;
 
     dst.extend_from_slice(&len.to_le_bytes());
     dst.extend_from_slice(data);

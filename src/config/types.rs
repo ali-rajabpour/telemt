@@ -429,7 +429,7 @@ pub struct GeneralConfig {
     pub ad_tag: Option<String>,
 
     /// Public IP override for middle-proxy NAT environments.
-    /// When set, this IP is used in ME key derivation and RPC_PROXY_REQ "our_addr".
+    /// When set, this IP is used in ME key derivation and local address translation.
     #[serde(default)]
     pub middle_proxy_nat_ip: Option<IpAddr>,
 

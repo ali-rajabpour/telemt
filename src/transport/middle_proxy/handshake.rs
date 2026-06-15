@@ -293,6 +293,8 @@ impl MePool {
         };
         record_bnd_status(bnd_addr_status, bnd_port_status, raw_socks_bound_addr);
         let socks_bound_kdf_addr = socks_bound_addr.filter(|bound| bound.port() != 0);
+        // SOCKS BND is the only reflected source that can supply both KDF IP and
+        // port. Direct STUN reflection is IP-only and keeps the TCP local port.
         let reflected = if let Some(bound) = socks_bound_kdf_addr {
             Some(bound)
         } else if is_socks_route {
@@ -417,6 +419,7 @@ impl MePool {
             key_selector = format_args!("0x{ks:08x}"),
             crypto_schema = format_args!("0x{schema:08x}"),
             skew_secs = skew,
+            socks_kdf_policy = ?self.socks_kdf_policy(),
             "ME key derivation parameters"
         );
 
