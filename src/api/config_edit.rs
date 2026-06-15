@@ -333,7 +333,7 @@ mod tests {
         let patch: Json = serde_json::json!({"general": {"links": {"show": ["alice"]}}});
         let resp = apply_patch_to_path(&path, &patch, None).await.unwrap();
         assert!(resp.changed.iter().any(|c| c == "general"));
-        let written = std::fs::read_to_string(&path).unwrap();
+        let written = tokio::fs::read_to_string(&path).await.unwrap();
         let parsed: toml::Value = toml::from_str(&written).unwrap();
         assert_eq!(
             parsed["general"]["links"]["show"][0].as_str(),
@@ -353,7 +353,7 @@ mod tests {
         let patch: Json = serde_json::json!({"general": {"links": {"public_port": 443}}});
         apply_patch_to_path(&path, &patch, None).await.unwrap();
 
-        let written = std::fs::read_to_string(&path).unwrap();
+        let written = tokio::fs::read_to_string(&path).await.unwrap();
         assert!(written.contains("public_port = 443"), "{written}");
         assert!(!written.contains("443.0"), "must not be a float:\n{written}");
         assert!(!written.contains("\"443\""), "must not be a string:\n{written}");

@@ -520,14 +520,14 @@ mod tests {
 
     #[tokio::test]
     async fn save_general_section_keeps_subtables_dotted_without_duplicates() {
-        let dir = std::env::temp_dir().join(format!("cfgtest-{}", rand::random::<u64>()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.toml");
-        std::fs::write(
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        tokio::fs::write(
             &path,
             "[general]\nprefer_ipv6 = false\n\n[general.modes]\ntls = true\n\n\
              [general.links]\npublic_host = \"old.example\"\n\n[server]\nport = 443\n",
         )
+        .await
         .unwrap();
 
         let mut cfg = ProxyConfig::default();
@@ -537,7 +537,7 @@ mod tests {
             .await
             .unwrap();
 
-        let written = std::fs::read_to_string(&path).unwrap();
+        let written = tokio::fs::read_to_string(&path).await.unwrap();
 
         // No bare top-level [modes] / [links] headers leaked.
         for line in written.lines() {
@@ -563,19 +563,18 @@ mod tests {
             .unwrap_or_else(|e| panic!("written config must parse: {e}\n{written}"));
 
         assert!(written.contains("[server]\nport = 443")); // untouched table kept
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
     async fn save_general_section_is_idempotent_across_repeated_saves() {
-        let dir = std::env::temp_dir().join(format!("cfgtest-{}", rand::random::<u64>()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.toml");
-        std::fs::write(
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        tokio::fs::write(
             &path,
             "[general]\nprefer_ipv6 = false\n\n[general.modes]\ntls = true\n\n\
              [general.links]\npublic_host = \"old.example\"\n",
         )
+        .await
         .unwrap();
 
         let mut cfg = ProxyConfig::default();
@@ -588,13 +587,12 @@ mod tests {
             .await
             .unwrap();
 
-        let written = std::fs::read_to_string(&path).unwrap();
+        let written = tokio::fs::read_to_string(&path).await.unwrap();
         assert_eq!(written.matches("[general.modes]").count(), 1, "{written}");
         assert_eq!(written.matches("[general.links]").count(), 1, "{written}");
         assert_eq!(written.matches("[general]").count(), 1, "{written}");
         toml::from_str::<toml::Value>(&written)
             .unwrap_or_else(|e| panic!("written config must parse: {e}\n{written}"));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -623,15 +621,15 @@ mod tests {
 
     #[tokio::test]
     async fn save_general_handles_non_contiguous_subtables() {
-        let dir = std::env::temp_dir().join(format!("cfgtest-{}", rand::random::<u64>()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
         // Hand-edited layout: [general.modes] sits AFTER an unrelated [server].
-        std::fs::write(
+        tokio::fs::write(
             &path,
             "[general]\nprefer_ipv6 = false\n\n[server]\nport = 443\n\n\
              [general.modes]\ntls = true\n",
         )
+        .await
         .unwrap();
 
         let mut cfg = ProxyConfig::default();
@@ -641,7 +639,7 @@ mod tests {
             .await
             .unwrap();
 
-        let written = std::fs::read_to_string(&path).unwrap();
+        let written = tokio::fs::read_to_string(&path).await.unwrap();
         assert_eq!(
             written.matches("[general.modes]").count(),
             1,
@@ -650,7 +648,6 @@ mod tests {
         toml::from_str::<toml::Value>(&written)
             .unwrap_or_else(|e| panic!("written config must parse: {e}\n{written}"));
         assert!(written.contains("[server]")); // unrelated section preserved
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
