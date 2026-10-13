@@ -21,6 +21,17 @@ fn runtime_log_filter() -> RuntimeLogFilter {
     RuntimeLogFilter::new(handle)
 }
 
+fn prepared_runtime(generation: Arc<RuntimeGeneration>) -> PreparedRuntime {
+    let (config_watcher_activation, _activation_rx) = watch::channel(false);
+    let user_admission_epoch = generation.proxy_shared.user_admission().epoch();
+    PreparedRuntime {
+        generation,
+        detected_ips: (None, None),
+        config_watcher_activation,
+        user_admission_epoch,
+    }
+}
+
 async fn fixture(request: ReloadRequest) -> ReloadFixture {
     let old_runtime = test_runtime_generation(1, ProxyConfig::default());
     let new_config = Arc::new(ProxyConfig::default());
@@ -33,15 +44,24 @@ async fn fixture(request: ReloadRequest) -> ReloadFixture {
         .unwrap();
     let (detected_ips_tx, _detected_ips_rx) = watch::channel((None, None));
     let (runtime_watch_tx, runtime_watch_rx) = watch::channel(Some(old_runtime.watch_state()));
+    let listener_manager = Arc::new(Mutex::new(ListenerManager::empty(active_runtime.clone())));
+    let web_trace = crate::web::trace::WebTraceStore::new(
+        old_runtime.config().web.debug.clone(),
+        &old_runtime.config().web.limits,
+    );
     let supervisor = Arc::new(ReloadSupervisor {
         active_runtime,
         control: control.clone(),
         commands,
         config_path: PathBuf::new(),
         quota_store: Arc::new(QuotaStore::default()),
+        tls_full_cert_budget: Arc::new(crate::tls_front::cache::TlsFullCertBudget::new()),
         detected_ips_tx,
         runtime_log_filter: runtime_log_filter(),
         runtime_watch_tx,
+        listener_manager,
+        web_trace,
+        conntrack_firewall: None,
     });
     let command = ReloadCommand {
         reload_id: accepted.reload_id,
@@ -113,12 +133,8 @@ async fn revision_rollback_keeps_old_generation_and_cleans_candidate() {
         .activate_prepared(
             fixture.command,
             fixture.old_runtime.clone(),
-            PreparedRuntime {
-                generation: fixture.new_runtime,
-                detected_ips: (None, None),
-            },
+            prepared_runtime(fixture.new_runtime),
             RevisionGateAction::Rollback("revision changed".to_string()),
-            |_| -> Result<(), String> { panic!("DNS activation must not run on rollback") },
         )
         .await;
 
@@ -139,47 +155,6 @@ async fn revision_rollback_keeps_old_generation_and_cleans_candidate() {
     let status = fixture.control.status(1).await.unwrap();
     assert_eq!(status.state, ReloadPhase::RolledBack);
     fixture.old_runtime.stop_sessions().await;
-}
-
-#[tokio::test]
-async fn dns_failure_policy_controls_rollback_or_keep_new() {
-    for policy in [ReloadFailurePolicy::Rollback, ReloadFailurePolicy::KeepNew] {
-        let fixture = fixture(ReloadRequest {
-            failure_policy: policy,
-            ..ReloadRequest::default()
-        })
-        .await;
-        fixture
-            .supervisor
-            .activate_prepared(
-                fixture.command,
-                fixture.old_runtime.clone(),
-                PreparedRuntime {
-                    generation: fixture.new_runtime.clone(),
-                    detected_ips: (None, None),
-                },
-                RevisionGateAction::Proceed,
-                |_| Err("invalid DNS entry".to_string()),
-            )
-            .await;
-
-        let status = fixture.control.status(1).await.unwrap();
-        match policy {
-            ReloadFailurePolicy::Rollback => {
-                assert_eq!(fixture.supervisor.active_runtime.load().id, 1);
-                assert_eq!(status.state, ReloadPhase::RolledBack);
-                assert!(fixture.old_runtime.spawn_session(async {}));
-                fixture.old_runtime.stop_sessions().await;
-            }
-            ReloadFailurePolicy::KeepNew => {
-                assert_eq!(fixture.supervisor.active_runtime.load().id, 2);
-                assert_eq!(status.state, ReloadPhase::Succeeded);
-                assert_eq!(status.warnings.len(), 1);
-                assert!(!fixture.old_runtime.spawn_session(async {}));
-                fixture.new_runtime.stop_sessions().await;
-            }
-        }
-    }
 }
 
 #[tokio::test]
@@ -208,12 +183,8 @@ async fn drain_publishes_new_generation_before_old_sessions_finish() {
             .activate_prepared(
                 fixture.command,
                 old_runtime,
-                PreparedRuntime {
-                    generation: new_runtime,
-                    detected_ips: (None, None),
-                },
+                prepared_runtime(new_runtime),
                 RevisionGateAction::Proceed,
-                |_| Ok(()),
             )
             .await;
     });
@@ -264,12 +235,8 @@ async fn drain_timeout_cancels_old_sessions_and_records_one_warning() {
             .activate_prepared(
                 fixture.command,
                 old_runtime,
-                PreparedRuntime {
-                    generation: new_runtime,
-                    detected_ips: (None, None),
-                },
+                prepared_runtime(new_runtime),
                 RevisionGateAction::Proceed,
-                |_| Ok(()),
             )
             .await;
     });
@@ -293,15 +260,23 @@ async fn quiesce_joins_idle_supervisor_and_rejects_later_submissions() {
     let (control, commands) = ReloadControl::channel(runtime.id);
     let (detected_ips_tx, _detected_ips_rx) = watch::channel((None, None));
     let (runtime_watch_tx, _runtime_watch_rx) = watch::channel(Some(runtime.watch_state()));
+    let listener_manager = ListenerManager::empty(active_runtime.clone());
     let handle = ReloadSupervisor::spawn(
         active_runtime,
         control.clone(),
         commands,
         PathBuf::new(),
         Arc::new(QuotaStore::default()),
+        Arc::new(crate::tls_front::cache::TlsFullCertBudget::new()),
         detected_ips_tx,
         runtime_log_filter(),
         runtime_watch_tx,
+        listener_manager,
+        crate::web::trace::WebTraceStore::new(
+            runtime.config().web.debug.clone(),
+            &runtime.config().web.limits,
+        ),
+        None,
     );
 
     tokio::time::timeout(Duration::from_secs(1), handle.quiesce())

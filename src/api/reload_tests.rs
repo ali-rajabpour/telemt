@@ -8,7 +8,7 @@ async fn config_file() -> (tempfile::TempDir, PathBuf, String) {
     config.server.max_connections = 4_242;
     let body = toml::to_string_pretty(&config).unwrap();
     tokio::fs::write(&path, &body).await.unwrap();
-    let revision = config_store::compute_revision(&body);
+    let revision = config_store::current_revision(&path).await.unwrap();
     (directory, path, revision)
 }
 
@@ -112,6 +112,7 @@ fn reload_routes_expose_only_documented_methods_and_ids() {
         Some(ALLOW_GET)
     );
     assert_eq!(reload_status_route_id("/v1/system/reload/42"), Some(42));
+    assert_eq!(allowed_methods_for_path("/web-status"), Some(ALLOW_GET));
     assert_eq!(
         reload_status_route_id("/v1/system/reload/not-a-number"),
         None

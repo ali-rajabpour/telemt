@@ -1,12 +1,28 @@
-use super::render::render_metrics;
 use super::*;
 use http_body_util::BodyExt;
 use std::net::IpAddr;
 use std::time::SystemTime;
 
+use crate::stats::telemetry::TelemetryPolicy;
 use crate::tls_front::types::{
     CachedTlsData, ParsedServerHello, TlsBehaviorProfile, TlsCertPayload, TlsProfileSource,
 };
+
+const CAS_CONTENTION_SERIES: [(&str, &str, &str, u64); 8] = [
+    ("user", "up", "reserve", 1),
+    ("user", "down", "reserve", 2),
+    ("user", "up", "refund", 3),
+    ("user", "down", "refund", 4),
+    ("cidr", "up", "reserve", 5),
+    ("cidr", "down", "reserve", 6),
+    ("cidr", "up", "refund", 7),
+    ("cidr", "down", "refund", 8),
+];
+
+fn test_web_publication() -> crate::web::control::WebRuntimePublication {
+    let control = crate::web::control::WebRuntimeControl::new();
+    control.subscribe().borrow().clone()
+}
 
 #[tokio::test]
 async fn test_render_metrics_format() {
@@ -14,6 +30,9 @@ async fn test_render_metrics_format() {
     let shared_state = ProxySharedState::new();
     let tracker = UserIpTracker::new();
     let mut config = ProxyConfig::default();
+    shared_state
+        .traffic_limiter
+        .set_cas_contention_metrics_for_test([1, 2, 3, 4, 5, 6, 7, 8]);
     config
         .access
         .user_max_unique_ips
@@ -24,6 +43,10 @@ async fn test_render_metrics_format() {
     stats.increment_connects_bad_with_class("tls_handshake_bad_client");
     stats.increment_handshake_timeouts();
     stats.increment_handshake_failure_class("timeout");
+    stats.increment_conntrack_rule_reconcile_success_total();
+    stats.increment_conntrack_rule_reconcile_error_total();
+    stats.increment_conntrack_rule_rollback_success_total();
+    stats.increment_conntrack_rule_rollback_error_total();
     shared_state
         .handshake
         .auth_expensive_checks_total
@@ -65,6 +88,10 @@ async fn test_render_metrics_format() {
     stats.increment_me_endpoint_quarantine_draining_suppressed_total();
     stats.increment_user_connects("alice");
     stats.increment_user_curr_connects("alice");
+    let _connection_permit = stats
+        .connection_authority()
+        .try_acquire("alice", None)
+        .unwrap();
     stats.add_user_octets_from("alice", 1024);
     stats.add_user_octets_to("alice", 2048);
     stats.increment_user_msgs_from("alice");
@@ -75,7 +102,17 @@ async fn test_render_metrics_format() {
         .await
         .unwrap();
 
-    let output = render_metrics(&stats, shared_state.as_ref(), &config, &tracker, None).await;
+    let output = render_metrics(
+        &stats,
+        shared_state.as_ref(),
+        &config,
+        &tracker,
+        None,
+        &TlsFullCertBudget::new(),
+        &test_web_publication(),
+        None,
+    )
+    .await;
 
     assert!(output.contains(&format!(
         "telemt_build_info{{version=\"{}\"}} 1",
@@ -84,10 +121,16 @@ async fn test_render_metrics_format() {
     assert!(output.contains("telemt_connections_total 2"));
     assert!(output.contains("telemt_connections_bad_total 1"));
     assert!(
-        output.contains("telemt_connections_bad_by_class_total{class=\"tls_handshake_bad_client\"} 1")
+        output.contains(
+            "telemt_connections_bad_by_class_total{class=\"tls_handshake_bad_client\"} 1"
+        )
     );
     assert!(output.contains("telemt_handshake_timeouts_total 1"));
     assert!(output.contains("telemt_handshake_failures_by_class_total{class=\"timeout\"} 1"));
+    assert!(output.contains("telemt_conntrack_rule_reconcile_total{result=\"success\"} 1"));
+    assert!(output.contains("telemt_conntrack_rule_reconcile_total{result=\"error\"} 1"));
+    assert!(output.contains("telemt_conntrack_rule_rollback_total{result=\"success\"} 1"));
+    assert!(output.contains("telemt_conntrack_rule_rollback_total{result=\"error\"} 1"));
     assert!(output.contains("telemt_auth_expensive_checks_total 9"));
     assert!(output.contains("telemt_auth_budget_exhausted_total 2"));
     assert!(output.contains("telemt_upstream_connect_attempt_total 2"));
@@ -125,10 +168,10 @@ async fn test_render_metrics_format() {
     assert!(output.contains("telemt_me_endpoint_quarantine_draining_suppressed_total 1"));
     assert!(output.contains("telemt_user_connections_total{user=\"alice\"} 1"));
     assert!(output.contains("telemt_user_connections_current{user=\"alice\"} 1"));
-    assert!(output.contains("telemt_user_octets_from_client{user=\"alice\"} 1024"));
-    assert!(output.contains("telemt_user_octets_to_client{user=\"alice\"} 2048"));
-    assert!(output.contains("telemt_user_msgs_from_client{user=\"alice\"} 1"));
-    assert!(output.contains("telemt_user_msgs_to_client{user=\"alice\"} 2"));
+    assert!(output.contains("telemt_user_octets_from_client_total{user=\"alice\"} 1024"));
+    assert!(output.contains("telemt_user_octets_to_client_total{user=\"alice\"} 2048"));
+    assert!(output.contains("telemt_user_msgs_from_client_total{user=\"alice\"} 1"));
+    assert!(output.contains("telemt_user_msgs_to_client_total{user=\"alice\"} 2"));
     assert!(output.contains("telemt_user_unique_ips_current{user=\"alice\"} 1"));
     assert!(output.contains("telemt_user_unique_ips_recent_window{user=\"alice\"} 1"));
     assert!(output.contains("telemt_user_unique_ips_limit{user=\"alice\"} 4"));
@@ -136,6 +179,17 @@ async fn test_render_metrics_format() {
     assert!(output.contains("telemt_ip_tracker_users{scope=\"active\"} 1"));
     assert!(output.contains("telemt_ip_tracker_entries{scope=\"active\"} 1"));
     assert!(output.contains("telemt_ip_tracker_cleanup_queue_len 0"));
+    for (scope, direction, operation, value) in CAS_CONTENTION_SERIES {
+        assert!(output.contains(&format!(
+            "telemt_rate_limiter_cas_retry_exhausted_total{{scope=\"{scope}\",direction=\"{direction}\",operation=\"{operation}\"}} {value}"
+        )));
+    }
+    assert_eq!(
+        output
+            .matches("telemt_rate_limiter_cas_retry_exhausted_total{")
+            .count(),
+        8
+    );
 }
 
 #[tokio::test]
@@ -200,7 +254,17 @@ async fn test_render_tls_front_profile_health() {
         )
         .await;
 
-    let output = render_metrics(&stats, &shared_state, &config, &tracker, Some(&cache)).await;
+    let output = render_metrics(
+        &stats,
+        &shared_state,
+        &config,
+        &tracker,
+        Some(&cache),
+        &TlsFullCertBudget::new(),
+        &test_web_publication(),
+        None,
+    )
+    .await;
 
     assert!(output.contains("telemt_tls_front_profile_domains{status=\"configured\"} 2"));
     assert!(output.contains("telemt_tls_front_profile_domains{status=\"emitted\"} 2"));
@@ -239,12 +303,67 @@ async fn test_render_tls_front_profile_health() {
 }
 
 #[tokio::test]
-async fn test_render_empty_stats() {
+async fn process_tls_budget_metrics_survive_a_generation_without_tls_cache() {
     let stats = Stats::new();
     let shared_state = ProxySharedState::new();
     let tracker = UserIpTracker::new();
     let config = ProxyConfig::default();
-    let output = render_metrics(&stats, &shared_state, &config, &tracker, None).await;
+    let budget = Arc::new(TlsFullCertBudget::new());
+    let cache = TlsFrontCache::new_with_full_cert_budget(
+        &["example.com".to_string()],
+        1024,
+        "tlsfront-test-cache",
+        Arc::clone(&budget),
+    );
+    assert!(
+        cache
+            .take_full_cert_budget_for_ip(
+                "example.com",
+                "127.0.0.1".parse().unwrap(),
+                Duration::from_secs(60),
+            )
+            .await
+    );
+
+    let output = render_metrics(
+        &stats,
+        &shared_state,
+        &config,
+        &tracker,
+        None,
+        budget.as_ref(),
+        &test_web_publication(),
+        None,
+    )
+    .await;
+
+    assert!(output.contains("telemt_tls_front_full_cert_budget_entries 1"));
+}
+
+#[tokio::test]
+async fn test_render_empty_stats() {
+    let stats = Stats::new();
+    let shared_state = ProxySharedState::new();
+    stats.apply_telemetry_policy(TelemetryPolicy {
+        core_enabled: false,
+        ..TelemetryPolicy::default()
+    });
+    shared_state
+        .traffic_limiter
+        .set_cas_contention_metrics_for_test([1, 2, 3, 4, 5, 6, 7, 8]);
+    let tracker = UserIpTracker::new();
+    let config = ProxyConfig::default();
+    let output = render_metrics(
+        &stats,
+        &shared_state,
+        &config,
+        &tracker,
+        None,
+        &TlsFullCertBudget::new(),
+        &test_web_publication(),
+        None,
+    )
+    .await;
     assert!(output.contains("telemt_connections_total 0"));
     assert!(output.contains("telemt_connections_bad_total 0"));
     assert!(output.contains("telemt_handshake_timeouts_total 0"));
@@ -252,6 +371,11 @@ async fn test_render_empty_stats() {
     assert!(output.contains("telemt_auth_budget_exhausted_total 0"));
     assert!(output.contains("telemt_user_unique_ips_current{user="));
     assert!(output.contains("telemt_user_unique_ips_recent_window{user="));
+    for (scope, direction, operation, _) in CAS_CONTENTION_SERIES {
+        assert!(output.contains(&format!(
+            "telemt_rate_limiter_cas_retry_exhausted_total{{scope=\"{scope}\",direction=\"{direction}\",operation=\"{operation}\"}} 0"
+        )));
+    }
 }
 
 #[tokio::test]
@@ -268,7 +392,17 @@ async fn test_render_uses_global_each_unique_ip_limit() {
     let mut config = ProxyConfig::default();
     config.access.user_max_unique_ips_global_each = 2;
 
-    let output = render_metrics(&stats, &shared_state, &config, &tracker, None).await;
+    let output = render_metrics(
+        &stats,
+        &shared_state,
+        &config,
+        &tracker,
+        None,
+        &TlsFullCertBudget::new(),
+        &test_web_publication(),
+        None,
+    )
+    .await;
 
     assert!(output.contains("telemt_user_unique_ips_limit{user=\"alice\"} 2"));
     assert!(output.contains("telemt_user_unique_ips_utilization{user=\"alice\"} 0.500000"));
@@ -280,7 +414,17 @@ async fn test_render_has_type_annotations() {
     let shared_state = ProxySharedState::new();
     let tracker = UserIpTracker::new();
     let config = ProxyConfig::default();
-    let output = render_metrics(&stats, &shared_state, &config, &tracker, None).await;
+    let output = render_metrics(
+        &stats,
+        &shared_state,
+        &config,
+        &tracker,
+        None,
+        &TlsFullCertBudget::new(),
+        &test_web_publication(),
+        None,
+    )
+    .await;
     assert!(output.contains("# TYPE telemt_uptime_seconds gauge"));
     assert!(output.contains("# TYPE telemt_connections_total counter"));
     assert!(output.contains("# TYPE telemt_connections_bad_total counter"));
@@ -323,7 +467,7 @@ async fn test_render_has_type_annotations() {
     assert!(output.contains("# TYPE telemt_ip_tracker_cap_rejects_total counter"));
     assert!(output.contains("# TYPE telemt_tls_fetch_profile_cache_entries gauge"));
     assert!(output.contains("# TYPE telemt_tls_fetch_profile_cache_cap_drops_total counter"));
-    assert!(output.contains("# TYPE telemt_tls_front_full_cert_budget_ips gauge"));
+    assert!(output.contains("# TYPE telemt_tls_front_full_cert_budget_entries gauge"));
     assert!(output.contains("# TYPE telemt_tls_front_full_cert_budget_cap_drops_total counter"));
     assert!(output.contains("# TYPE telemt_tls_front_profile_domains gauge"));
     assert!(output.contains("# TYPE telemt_tls_front_profile_info gauge"));
@@ -339,27 +483,20 @@ async fn test_render_has_type_annotations() {
 
 #[tokio::test]
 async fn test_endpoint_integration() {
-    let stats = Arc::new(Stats::new());
-    let beobachten = Arc::new(BeobachtenStore::new());
-    let shared_state = ProxySharedState::new();
-    let tracker = UserIpTracker::new();
     let mut config = ProxyConfig::default();
-    stats.increment_connects_all();
-    stats.increment_connects_all();
-    stats.increment_connects_all();
+    config.general.beobachten = true;
+    config.general.beobachten_minutes = 10;
+    let runtime = crate::maestro::generation::test_runtime_generation(1, config);
+    let web_publication = test_web_publication();
+    let tls_full_cert_budget = TlsFullCertBudget::new();
+    runtime.stats.increment_connects_all();
+    runtime.stats.increment_connects_all();
+    runtime.stats.increment_connects_all();
 
     let req = Request::builder().uri("/metrics").body(()).unwrap();
-    let resp = handle(
-        req,
-        &stats,
-        &beobachten,
-        shared_state.as_ref(),
-        &tracker,
-        None,
-        &config,
-    )
-    .await
-    .unwrap();
+    let resp = handle(req, &runtime, &web_publication, &tls_full_cert_budget)
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     assert!(
@@ -376,25 +513,15 @@ async fn test_endpoint_integration() {
             ))
     );
 
-    config.general.beobachten = true;
-    config.general.beobachten_minutes = 10;
-    beobachten.record(
+    runtime.beobachten.record(
         "TLS-scanner",
         "203.0.113.10".parse::<IpAddr>().unwrap(),
         Duration::from_secs(600),
     );
     let req_beob = Request::builder().uri("/beobachten").body(()).unwrap();
-    let resp_beob = handle(
-        req_beob,
-        &stats,
-        &beobachten,
-        shared_state.as_ref(),
-        &tracker,
-        None,
-        &config,
-    )
-    .await
-    .unwrap();
+    let resp_beob = handle(req_beob, &runtime, &web_publication, &tls_full_cert_budget)
+        .await
+        .unwrap();
     assert_eq!(resp_beob.status(), StatusCode::OK);
     let body_beob = resp_beob.into_body().collect().await.unwrap().to_bytes();
     let beob_text = std::str::from_utf8(body_beob.as_ref()).unwrap();
@@ -402,16 +529,8 @@ async fn test_endpoint_integration() {
     assert!(beob_text.contains("203.0.113.10-1"));
 
     let req404 = Request::builder().uri("/other").body(()).unwrap();
-    let resp404 = handle(
-        req404,
-        &stats,
-        &beobachten,
-        shared_state.as_ref(),
-        &tracker,
-        None,
-        &config,
-    )
-    .await
-    .unwrap();
+    let resp404 = handle(req404, &runtime, &web_publication, &tls_full_cert_budget)
+        .await
+        .unwrap();
     assert_eq!(resp404.status(), StatusCode::NOT_FOUND);
 }

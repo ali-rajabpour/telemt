@@ -27,6 +27,7 @@ mod protocol;
 mod proxy;
 mod quota_state;
 mod service;
+mod slot_budget;
 mod startup;
 mod stats;
 mod stream;
@@ -34,6 +35,7 @@ mod synlimit_control;
 mod tls_front;
 mod transport;
 mod util;
+mod web;
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Install rustls crypto provider early

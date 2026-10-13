@@ -8,8 +8,6 @@
 // Infrastructure module used via CLI flags.
 #![allow(dead_code)]
 
-use std::path::Path;
-
 use crate::config::{LogRotation, LoggingConfig, LoggingDestination};
 
 use tracing_subscriber::layer::SubscriberExt;
@@ -79,6 +77,8 @@ pub struct LoggingOptions {
     pub destination: LogDestination,
     /// Disable ANSI colors.
     pub disable_colors: bool,
+    /// Require trusted, symlink-free log parents on Unix. Disabled by default for compatibility.
+    pub strict_runtime_paths: bool,
 }
 
 /// Guard that must be held to keep file logging active.
@@ -127,7 +127,6 @@ pub fn init_logging(
 
         #[cfg(unix)]
         LogDestination::Syslog => {
-            // Use a custom fmt layer that writes to syslog
             let fmt_layer = fmt::Layer::default()
                 .with_ansi(false)
                 .with_target(false)
@@ -144,31 +143,10 @@ pub fn init_logging(
         }
 
         LogDestination::File { options } => {
-            let (non_blocking, guard) = if options.max_size_bytes > 0
-                || options.max_files > 0
-                || options.max_age_secs > 0
-            {
-                let file_appender = file::BoundedFileAppender::new(options.clone())
+            let file_appender =
+                file::BoundedFileAppender::new(options.clone(), opts.strict_runtime_paths)
                     .expect("Failed to open log file");
-                tracing_appender::non_blocking(file_appender)
-            } else if !matches!(options.rotation, LogRotation::Never) {
-                let path = Path::new(&options.path);
-                let dir = log_file_dir(path);
-                let prefix = log_file_name(path);
-                let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
-                    .rotation(to_tracing_rotation(options.rotation))
-                    .filename_prefix(prefix)
-                    .build(dir)
-                    .expect("Failed to open log file");
-                tracing_appender::non_blocking(file_appender)
-            } else {
-                let file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&options.path)
-                    .expect("Failed to open log file");
-                tracing_appender::non_blocking(file)
-            };
+            let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
             let fmt_layer = fmt::Layer::default()
                 .with_ansi(false)
@@ -182,28 +160,6 @@ pub fn init_logging(
 
             (filter_handle, LoggingGuard::new(Some(guard)))
         }
-    }
-}
-
-fn log_file_dir(path: &Path) -> &Path {
-    path.parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."))
-}
-
-fn log_file_name(path: &Path) -> &str {
-    path.file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("telemt")
-}
-
-fn to_tracing_rotation(rotation: LogRotation) -> tracing_appender::rolling::Rotation {
-    match rotation {
-        LogRotation::Never => tracing_appender::rolling::Rotation::NEVER,
-        LogRotation::Minutely => tracing_appender::rolling::Rotation::MINUTELY,
-        LogRotation::Hourly => tracing_appender::rolling::Rotation::HOURLY,
-        LogRotation::Daily => tracing_appender::rolling::Rotation::DAILY,
-        LogRotation::Weekly => tracing_appender::rolling::Rotation::WEEKLY,
     }
 }
 
@@ -221,14 +177,10 @@ struct SyslogWriter {
 #[cfg(unix)]
 impl SyslogMakeWriter {
     fn new() -> Self {
-        // Open syslog connection on first use
         static INIT: std::sync::Once = std::sync::Once::new();
-        INIT.call_once(|| {
-            unsafe {
-                // Open syslog with ident "telemt", LOG_PID, LOG_DAEMON facility
-                let ident = b"telemt\0".as_ptr() as *const libc::c_char;
-                libc::openlog(ident, libc::LOG_PID | libc::LOG_NDELAY, libc::LOG_DAEMON);
-            }
+        INIT.call_once(|| unsafe {
+            let ident = b"telemt\0".as_ptr() as *const libc::c_char;
+            libc::openlog(ident, libc::LOG_PID | libc::LOG_NDELAY, libc::LOG_DAEMON);
         });
         Self
     }
@@ -248,7 +200,6 @@ fn syslog_priority_for_level(level: &tracing::Level) -> libc::c_int {
 #[cfg(unix)]
 impl std::io::Write for SyslogWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        // Convert to C string, stripping newlines
         let msg = String::from_utf8_lossy(buf);
         let msg = msg.trim_end();
 
@@ -256,7 +207,6 @@ impl std::io::Write for SyslogWriter {
             return Ok(buf.len());
         }
 
-        // Write to syslog
         let c_msg = std::ffi::CString::new(msg.as_bytes())
             .unwrap_or_else(|_| std::ffi::CString::new("(invalid utf8)").unwrap());
 

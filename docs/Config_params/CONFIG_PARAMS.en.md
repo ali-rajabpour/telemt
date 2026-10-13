@@ -10,7 +10,7 @@ This document lists all configuration keys accepted by `config.toml`.
 >
 > The configuration parameters detailed in this document are intended for advanced users and fine-tuning purposes. Modifying these settings without a clear understanding of their function may lead to application instability or other unexpected behavior. Please proceed with caution and at your own risk.
 
-> `Hot-Reload` marks whether a changed value is applied by the config watcher without restarting the process; `✘` means restart is required for runtime effect.
+> `Hot-Reload` marks whether a changed value is applied directly by the config watcher. `✘` means the watcher does not apply it; depending on the field, full effect requires an in-process runtime-generation reload or a process restart.
 
 # Table of contents
  - [Top-level keys](#top-level-keys)
@@ -24,6 +24,13 @@ This document lists all configuration keys accepted by `config.toml`.
  - [server.conntrack_control](#serverconntrack_control)
  - [server.api](#serverapi)
  - [server.listeners](#serverlisteners)
+ - [web](#web)
+ - [web.debug](#webdebug)
+ - [web.limits](#weblimits)
+ - [web.timeouts](#webtimeouts)
+ - [web.vhosts](#webvhosts)
+ - [web.vhosts.decoy](#webvhostsdecoy)
+ - [web.vhosts.profiles](#webvhostsprofiles)
  - [timeouts](#timeouts)
  - [censorship](#censorship)
  - [censorship.tls_fetch](#censorshiptls_fetch)
@@ -197,6 +204,7 @@ This document lists all configuration keys accepted by `config.toml`.
 | [`me_keepalive_payload_random`](#me_keepalive_payload_random) | `bool` | `true` | `✘` |
 | [`rpc_proxy_req_every`](#rpc_proxy_req_every) | `u64` | `0` | `✘` |
 | [`me_writer_cmd_channel_capacity`](#me_writer_cmd_channel_capacity) | `usize` | `4096` | `✘` |
+| [`me_writer_byte_budget_bytes`](#me_writer_byte_budget_bytes) | `usize` | `33570816` | `✘` |
 | [`me_route_channel_capacity`](#me_route_channel_capacity) | `usize` | `768` | `✘` |
 | [`me_c2me_channel_capacity`](#me_c2me_channel_capacity) | `usize` | `1024` | `✘` |
 | [`me_c2me_send_timeout_ms`](#me_c2me_send_timeout_ms) | `u64` | `4000` | `✘` |
@@ -209,6 +217,7 @@ This document lists all configuration keys accepted by `config.toml`.
 | [`me_d2c_frame_buf_shrink_threshold_bytes`](#me_d2c_frame_buf_shrink_threshold_bytes) | `usize` | `262144` | `✔` |
 | [`direct_relay_copy_buf_c2s_bytes`](#direct_relay_copy_buf_c2s_bytes) | `usize` | `65536` | `✔` |
 | [`direct_relay_copy_buf_s2c_bytes`](#direct_relay_copy_buf_s2c_bytes) | `usize` | `262144` | `✔` |
+| [`direct_relay_buffer_budget_max_bytes`](#direct_relay_buffer_budget_max_bytes) | `usize` | `0` | `✘` |
 | [`crypto_pending_buffer`](#crypto_pending_buffer) | `usize` | `262144` | `✘` |
 | [`max_client_frame`](#max_client_frame) | `usize` | `16777216` | `✘` |
 | [`desync_all_full`](#desync_all_full) | `bool` | `false` | `✔` |
@@ -294,13 +303,14 @@ This document lists all configuration keys accepted by `config.toml`.
 | [`me_pool_drain_soft_evict_per_writer`](#me_pool_drain_soft_evict_per_writer) | `u8` | `2` | `✘` |
 | [`me_pool_drain_soft_evict_budget_per_core`](#me_pool_drain_soft_evict_budget_per_core) | `u16` | `16` | `✘` |
 | [`me_pool_drain_soft_evict_cooldown_ms`](#me_pool_drain_soft_evict_cooldown_ms) | `u64` | `1000` | `✘` |
-| [`me_bind_stale_mode`](#me_bind_stale_mode) | `"never"`, `"ttl"`, or `"always"` | `"ttl"` | `✔` |
+| [`me_bind_stale_mode`](#me_bind_stale_mode) | `"never"`, `"ttl"`, or `"always"` | `"never"` | `✔` |
 | [`me_bind_stale_ttl_secs`](#me_bind_stale_ttl_secs) | `u64` | `90` | `✔` |
 | [`me_pool_min_fresh_ratio`](#me_pool_min_fresh_ratio) | `f32` | `0.8` | `✔` |
 | [`me_reinit_drain_timeout_secs`](#me_reinit_drain_timeout_secs) | `u64` | `90` | `✔` |
 | [`proxy_secret_auto_reload_secs`](#proxy_secret_auto_reload_secs) | `u64` | `3600` | `✔` |
 | [`proxy_config_auto_reload_secs`](#proxy_config_auto_reload_secs) | `u64` | `3600` | `✔` |
 | [`me_reinit_singleflight`](#me_reinit_singleflight) | `bool` | `true` | `✔` |
+| [`me_reinit_max_concurrency`](#me_reinit_max_concurrency) | `usize` | `2` | `✔` |
 | [`me_reinit_trigger_channel`](#me_reinit_trigger_channel) | `usize` | `64` | `✘` |
 | [`me_reinit_coalesce_window_ms`](#me_reinit_coalesce_window_ms) | `u64` | `200` | `✔` |
 | [`me_deterministic_writer_sort`](#me_deterministic_writer_sort) | `bool` | `true` | `✔` |
@@ -339,6 +349,8 @@ This document lists all configuration keys accepted by `config.toml`.
     [general]
     config_strict = true
     ```
+
+  - **Known limitation**: In this revision, `config_strict = true` rejects the otherwise supported `access.user_source_deny` and `[[upstreams]].prefer` keys. Keep strict mode disabled when either key is present.
 ## prefer_ipv6
   - **Constraints / validation**: Deprecated. Use `network.prefer`.
   - **Description**: Deprecated legacy IPv6 preference flag migrated to `network.prefer`.
@@ -377,7 +389,7 @@ This document lists all configuration keys accepted by `config.toml`.
     ```
 ## proxy_secret_url
   - **Constraints / validation**: `String`. When omitted, the `"https://core.telegram.org/getProxySecret"` is used.
-  - **Description**: Optional URL to obtain `proxy-secret` file used by ME handshake/RPC auth. Telemt always tries a fresh download from this URL first (with fallback to `https://core.telegram.org/getProxySecret` if absent). 
+  - **Description**: Optional URL to obtain `proxy-secret` file used by ME handshake/RPC auth. Telemt always tries a fresh download from this URL first (with fallback to `https://core.telegram.org/getProxySecret` if absent).
   - **Example**:
 
     ```toml
@@ -475,8 +487,8 @@ This document lists all configuration keys accepted by `config.toml`.
     stun_nat_probe_concurrency = 8
     ```
 ## middle_proxy_pool_size
-  - **Constraints / validation**: `usize`. Effective value is `max(value, 1)` at runtime (so `0` behaves as `1`).
-  - **Description**: Target size of active ME writer pool.
+  - **Constraints / validation**: `usize`. The value passed to ME initialization is normalized as `max(value, 1)`.
+  - **Description**: Non-enforcing compatibility input currently emitted in the ME initialization log. Active writer targets are derived from the DC-family floor policy, not this value.
   - **Example**:
 
     ```toml
@@ -567,7 +579,7 @@ This document lists all configuration keys accepted by `config.toml`.
     rpc_proxy_req_every = 0
     ```
 ## me_writer_cmd_channel_capacity
-  - **Constraints / validation**: Must be `> 0`.
+  - **Constraints / validation**: Must be within `1..=16384`.
   - **Description**: Capacity of per-writer command channel.
   - **Example**:
 
@@ -575,8 +587,17 @@ This document lists all configuration keys accepted by `config.toml`.
     [general]
     me_writer_cmd_channel_capacity = 4096
     ```
+## me_writer_byte_budget_bytes
+  - **Constraints / validation**: Must be a multiple of `16384` within the dynamic minimum and `268435456`. The minimum is `2 * general.max_client_frame + 256`, rounded up to `16384`; with the default frame size it is `33570816`.
+  - **Description**: Resident byte budget for each ME writer data queue. The file watcher does not rebuild existing writers for this field; it takes effect when a new ME/runtime generation is built through the API or after restart.
+  - **Example**:
+
+    ```toml
+    [general]
+    me_writer_byte_budget_bytes = 33570816
+    ```
 ## me_route_channel_capacity
-  - **Constraints / validation**: Must be `> 0`.
+  - **Constraints / validation**: Must be within `1..=8192`.
   - **Description**: Capacity of per-connection ME response route channel.
   - **Example**:
 
@@ -585,7 +606,7 @@ This document lists all configuration keys accepted by `config.toml`.
     me_route_channel_capacity = 768
     ```
 ## me_c2me_channel_capacity
-  - **Constraints / validation**: Must be `> 0`.
+  - **Constraints / validation**: Must be within `1..=8192`.
   - **Description**: Capacity of per-client command queue (client reader -> ME sender).
   - **Example**:
 
@@ -683,6 +704,15 @@ This document lists all configuration keys accepted by `config.toml`.
     [general]
     direct_relay_copy_buf_s2c_bytes = 262144
     ```
+## direct_relay_buffer_budget_max_bytes
+  - **Constraints / validation**: `0`, or a multiple of `4096` within `16777216..=2147483648`.
+  - **Description**: Process-wide hard ceiling for Direct relay copy buffers. `0` derives the ceiling at process startup from cgroup or host memory limits. This field is process-owned and restart-deferred.
+  - **Example**:
+
+    ```toml
+    [general]
+    direct_relay_buffer_budget_max_bytes = 0
+    ```
 ## crypto_pending_buffer
   - **Constraints / validation**: `usize` (bytes).
   - **Description**: Max pending ciphertext buffer per client writer (bytes).
@@ -693,7 +723,7 @@ This document lists all configuration keys accepted by `config.toml`.
     crypto_pending_buffer = 262144
     ```
 ## max_client_frame
-  - **Constraints / validation**: `usize` (bytes).
+  - **Constraints / validation**: Must be within `4096..=16777216` (bytes).
   - **Description**: Maximum allowed client MTProto frame size (bytes).
   - **Example**:
 
@@ -1206,7 +1236,7 @@ This document lists all configuration keys accepted by `config.toml`.
     me_route_hybrid_max_wait_ms = 3000
     ```
 ## me_route_blocking_send_timeout_ms
-  - **Constraints / validation**: Must be within `0..=5000` (milliseconds). `0` keeps legacy unbounded wait behavior.
+  - **Constraints / validation**: Must be within `1..=5000` (milliseconds).
   - **Description**: Maximum wait for blocking route-channel send fallback.
   - **Example**:
 
@@ -1389,7 +1419,7 @@ This document lists all configuration keys accepted by `config.toml`.
     ```
 ## me_pool_drain_ttl_secs
   - **Constraints / validation**: `u64` (seconds). `0` disables the drain-TTL window (and suppresses drain-TTL warnings for non-empty draining writers).
-  - **Description**: Drain-TTL time window for stale ME writers after endpoint map changes. During the TTL, stale writers may be used only as fallback for new bindings (depending on bind policy).
+  - **Description**: Age threshold for prolonged-drain warnings after endpoint map changes and the lower bound used when normalizing the force-close timeout. Stale-bind eligibility is controlled separately by `me_bind_stale_mode` and `me_bind_stale_ttl_secs`.
   - **Example**:
 
     ```toml
@@ -1469,7 +1499,7 @@ This document lists all configuration keys accepted by `config.toml`.
     ```
 ## me_bind_stale_mode
   - **Constraints / validation**: `"never"`, `"ttl"`, or `"always"`.
-  - **Description**: Policy for new binds on stale draining writers.
+  - **Description**: Policy for new binds on stale draining writers in uncovered DC-family groups. The default `never` requires complete group coverage before a partial hardswap can commit; `ttl` and `always` permit policy-bounded fallback.
   - **Example**:
 
     ```toml
@@ -1479,7 +1509,7 @@ This document lists all configuration keys accepted by `config.toml`.
     ```
 ## me_bind_stale_ttl_secs
   - **Constraints / validation**: `u64`.
-  - **Description**: TTL for stale bind allowance when stale mode is `ttl`.
+  - **Description**: TTL for stale bind allowance when stale mode is `ttl`; `0` disables TTL expiry for eligible draining writers.
   - **Example**:
 
     ```toml
@@ -1489,7 +1519,7 @@ This document lists all configuration keys accepted by `config.toml`.
     ```
 ## me_pool_min_fresh_ratio
   - **Constraints / validation**: Must be within `[0.0, 1.0]`.
-  - **Description**: Minimum fresh desired-DC coverage ratio before stale writers are drained.
+  - **Description**: Minimum fresh DC-family coverage ratio required at generation commit. Missing groups still block commit under `me_bind_stale_mode = "never"` even when this ratio is satisfied.
   - **Example**:
 
     ```toml
@@ -1498,8 +1528,8 @@ This document lists all configuration keys accepted by `config.toml`.
     me_pool_min_fresh_ratio = 0.9
     ```
 ## me_reinit_drain_timeout_secs
-  - **Constraints / validation**: `u64`. `0` uses the runtime safety fallback force-close timeout. If `> 0` and `< me_pool_drain_ttl_secs`, runtime bumps it to TTL.
-  - **Description**: Force-close timeout for draining stale writers. When set to `0`, the effective timeout is the runtime safety fallback (300 seconds).
+  - **Constraints / validation**: `u64`. `0` first selects the 300-second runtime safety fallback; the effective timeout is then raised to at least `me_pool_drain_ttl_secs`.
+  - **Description**: Force-close timeout for draining stale writers. The effective value is the greater of the configured non-zero value (or 300 seconds for `0`) and the drain TTL.
   - **Example**:
 
     ```toml
@@ -1540,9 +1570,18 @@ This document lists all configuration keys accepted by `config.toml`.
     [general]
     me_reinit_singleflight = true
     ```
+## me_reinit_max_concurrency
+  - **Constraints / validation**: Must be within `[1, 8]`. The effective value is `1` while `me_reinit_singleflight = true`.
+  - **Description**: Bounds concurrent ME generation warmups. Excess triggers are coalesced into one pending rerun.
+  - **Example**:
+
+    ```toml
+    [general]
+    me_reinit_max_concurrency = 2
+    ```
 ## me_reinit_trigger_channel
-  - **Constraints / validation**: Must be `> 0`.
-  - **Description**: Trigger queue capacity for reinit scheduler.
+  - **Constraints / validation**: Must be within `[1, 4096]`.
+  - **Description**: Trigger queue capacity for the reinit scheduler. A new runtime generation constructs its channel from this value; the file watcher alone does not resize the active channel.
   - **Example**:
 
     ```toml
@@ -1971,7 +2010,7 @@ This document lists all configuration keys accepted by `config.toml`.
     ```
 ## client_mss
   - **Constraints / validation**: `String`. Empty or omitted means do not change kernel MSS. Presets: `"extreme-low"` = `88`, `"tspu"` = `92`, `"2in8"` = `256`. Custom decimal strings must be within `88..=4096`.
-  - **Description**: Client-facing TCP MSS applied to TCP listener sockets before `listen(2)`, so Linux can announce it in SYN/ACK. This affects only proxy client TCP listeners, not API, metrics, Unix sockets, Telegram upstreams, ME sockets, or mask backend connections. Changes require listener restart/rebind.
+  - **Description**: Controls the segment size used for client connections. By default, this value is applied to the TCP listener and remains active for the whole connection. When `client_mss_bulk` is also set on Linux, the accepted socket is temporarily clamped to `client_mss` while Telemt sends the initial authenticated FakeTLS response (`ServerHello`), then restored to the connection's bulk MSS on success, write error, or cancellation. This setting does not affect API, metrics, Unix sockets, Telegram upstreams, ME sockets, or mask backend connections. Changes require a listener restart/rebind.
   - **Operator note**: The two-tier `synlimit` profile does not require Telemt to disable MSS automatically. Operators that follow external host-tuning recipes should decide explicitly whether to leave MSS shaping enabled for handshake fragmentation or disable it for higher media throughput.
   - **Performance note**: Low MSS increases packet count predictably. Approximate segment multiplier is `ceil(1460 / client_mss)`.
   - **Example**:
@@ -1981,8 +2020,8 @@ This document lists all configuration keys accepted by `config.toml`.
     client_mss = "tspu"
     ```
 ## client_mss_bulk
-  - **Constraints / validation**: `String`. Same grammar as [`client_mss`](#client_mss) (empty/omitted, presets `"extreme-low"`/`"tspu"`/`"2in8"`, or a decimal in `88..=4096`).
-  - **Description**: Optional bulk-phase MSS. When set, the low `client_mss` is applied only while the TLS handshake (including the DPI-inspected ServerHello) is sent; once the connection transitions to relaying, the client socket MSS is raised to `client_mss_bulk` for the bulk data phase. This keeps the anti-DPI handshake fragmentation but restores normal-size packets for payload, cutting outgoing packets-per-second by roughly the `client_mss` segment multiplier (e.g. ~10x with `"tspu"`). Useful on hosts whose abuse detection counts packets-per-second rather than bandwidth. When empty/omitted, the handshake MSS is kept for the whole connection (previous behavior). Linux only; a no-op elsewhere.
+  - **Constraints / validation**: Linux-only `String`. Same grammar as [`client_mss`](#client_mss) (empty/omitted, presets `"extreme-low"`/`"tspu"`/`"2in8"`, or a decimal in `88..=4096`). A non-empty value requires at least one listener with an effective `client_mss`, and it must be greater than every participating listener's handshake value. A listener may use `client_mss = ""` as an explicit opt-out.
+  - **Description**: Enables an experimental two-size profile. The listener uses `client_mss_bulk` from the start of the connection, including when the client sends `ClientHello`. Telemt temporarily clamps the accepted socket's `TCP_MAXSEG` to `client_mss` and sends the initial authenticated FakeTLS response (`ServerHello`) in writes no larger than that value, then restores the prior socket MSS before normal MTProto traffic. Restoration is attempted on success, write error, and task cancellation. TCP is a byte stream: `MSG_EOR`, TCP offloads, loss, and retransmission can still change observable capture boundaries, so the release packet-capture gate remains authoritative. When this option is empty or omitted, `client_mss` remains the kernel MSS for the whole connection. Changes require listener restart/rebind.
   - **Example**:
 
     ```toml
@@ -2011,7 +2050,7 @@ This document lists all configuration keys accepted by `config.toml`.
     ```
 ## proxy_protocol_trusted_cidrs
   - **Constraints / validation**: `IpNetwork[]`.
-    - If omitted, defaults to trust-all CIDRs (`0.0.0.0/0` and `::/0`). 
+    - If omitted, defaults to trust-all CIDRs (`0.0.0.0/0` and `::/0`).
       > In production behind HAProxy/nginx, prefer setting explicit trusted CIDRs instead of relying on this fallback.
     - If explicitly set to an empty array, all PROXY headers are rejected.
   - **Description**: Trusted source CIDRs allowed to provide PROXY protocol headers (security control).
@@ -2311,19 +2350,22 @@ Note: This section also accepts the legacy alias `[server.admin_api]` (same sche
 | [`ip`](#ip) | `IpAddr` | — | `✘` |
 | [`port`](#port-serverlisteners) | `u16` | `server.port` | `✘` |
 | [`client_mss`](#client_mss-serverlisteners) | `String` | `[server].client_mss` | `✘` |
-| [`synlimit`](#synlimit-serverlisteners) | `false`, `"iptables"`, or `"nftables"` | `false` | `✔` |
-| [`synlimit_seconds`](#synlimit_seconds-serverlisteners) | `u32` | `60` | `✔` |
-| [`synlimit_hitcount`](#synlimit_hitcount-serverlisteners) | `u32` | `48` | `✔` |
-| [`synlimit_burst`](#synlimit_burst-serverlisteners) | `u32` | `1` | `✔` |
-| [`synlimit_ios_seconds`](#synlimit_ios_seconds-serverlisteners) | `u32` | `1` | `✔` |
-| [`synlimit_ios_hitcount`](#synlimit_ios_hitcount-serverlisteners) | `u32` | `12` | `✔` |
-| [`synlimit_ios_burst`](#synlimit_ios_burst-serverlisteners) | `u32` | `24` | `✔` |
-| [`synlimit_hashlimit_expire_ms`](#synlimit_hashlimit_expire_ms-serverlisteners) | `u32` | `60000` | `✔` |
-| [`synlimit_hashlimit_size`](#synlimit_hashlimit_size-serverlisteners) | `u32` | `32768` | `✔` |
+| [`synlimit`](#synlimit-serverlisteners) | `false`, `"iptables"`, `"nftables"`, or `"pf"` | `false` | `✘` |
+| [`synlimit_seconds`](#synlimit_seconds-serverlisteners) | `u32` | `60` | `✘` |
+| [`synlimit_hitcount`](#synlimit_hitcount-serverlisteners) | `u32` | `48` | `✘` |
+| [`synlimit_burst`](#synlimit_burst-serverlisteners) | `u32` | `24` | `✘` |
+| [`synlimit_ios_seconds`](#synlimit_ios_seconds-serverlisteners) | `u32` | `1` | `✘` |
+| [`synlimit_ios_hitcount`](#synlimit_ios_hitcount-serverlisteners) | `u32` | `12` | `✘` |
+| [`synlimit_ios_burst`](#synlimit_ios_burst-serverlisteners) | `u32` | `24` | `✘` |
+| [`synlimit_hashlimit_expire_ms`](#synlimit_hashlimit_expire_ms-serverlisteners) | `u32` | `60000` | `✘` |
+| [`synlimit_hashlimit_size`](#synlimit_hashlimit_size-serverlisteners) | `u32` | `32768` | `✘` |
 | [`announce`](#announce) | `String` | — | `✘` |
 | [`announce_ip`](#announce_ip) | `IpAddr` | — | `✘` |
 | [`proxy_protocol`](#proxy_protocol) | `bool` | — | `✘` |
 | [`reuse_allow`](#reuse_allow) | `bool` | `false` | `✘` |
+| [`transport`](#transport-serverlisteners) | `"mtproxy"` or `"web"` | `"mtproxy"` | `✘` |
+| [`web_client_ip_source`](#web_client_ip_source-serverlisteners) | `"x_forwarded_for"` | `"x_forwarded_for"` | `✘` |
+| [`web_trusted_proxy_cidrs`](#web_trusted_proxy_cidrs-serverlisteners) | `IpNetwork[]` | `[]` | `✘` |
 
 ## ip
   - **Constraints / validation**: Required field. Must be an `IpAddr`.
@@ -2356,8 +2398,8 @@ Note: This section also accepts the legacy alias `[server.admin_api]` (same sche
     client_mss = "256"
     ```
 ## synlimit (server.listeners)
-  - **Constraints / validation**: `false`, `"iptables"`, or `"nftables"`. Omitted or `false` disables SYN limiting for this listener.
-  - **Description**: Installs per-listener Linux netfilter two-tier SYN-fix rules for the listener port. `"iptables"` uses `iptables`/`ip6tables` filter rules with the `hashlimit`, `length`, and TTL/hop-limit matches. `"nftables"` uses Telemt-owned tables with per-source `meter` rules and equivalent IPv4/IPv6 classifiers. Rules are inserted early in `INPUT`, accept under-limit SYN packets, and reject over-limit SYN packets with TCP RST so clients retry promptly instead of waiting for a silent DROP timeout. The generic bucket is controlled by `synlimit_seconds`, `synlimit_hitcount`, and `synlimit_burst`; the iOS-like TTL/length bucket is controlled by `synlimit_ios_*`. Rules are reconciled at runtime and removed during graceful Telemt shutdown; `SIGKILL` cannot be cleaned up by the process. Requires CAP_NET_ADMIN. `synlimit*` changes hot-reload for existing listener endpoints; changing listener `ip` or `port` still requires restart/rebind.
+  - **Constraints / validation**: `false`, `"iptables"`, `"nftables"`, or `"pf"`. Omitted or `false` disables SYN limiting for this listener.
+  - **Description**: Installs startup-owned per-listener firewall rules for the listener port. Linux accepts only `"iptables"` or `"nftables"`; FreeBSD accepts only `"pf"`; other platforms accept only `false`. Linux netfilter rules accept under-limit SYN packets and reject excess packets with TCP RST. PF renders explicit `inet`/`inet6` rules and uses native `max-src-conn-rate`; excess state-creating packets are silently dropped. Startup fails before accept loops if privileges, backend validation, stale-candidate cleanup, or rule application fails. Every `synlimit*` change requires process restart. Combining enabled SYN limiting with `--run-as-user` or `--run-as-group` is rejected until a separate privileged firewall helper exists. Rules are removed during graceful shutdown; `SIGKILL` cannot be cleaned up by the process. Linux requires CAP_NET_ADMIN. FreeBSD requires root and a main PF ruleset hook such as `anchor "telemt_synlimit/*"`.
   - **Operator note**: Telemt does not persist rules with `iptables-persistent`, write `/etc/sysctl.d`, edit systemd limits, or modify `client_mss`. Apply host-level tuning manually if your deployment policy requires it.
   - **Example**:
 
@@ -2371,10 +2413,15 @@ Note: This section also accepts the legacy alias `[server.admin_api]` (same sche
     ip = "::"
     port = 443
     synlimit = "nftables"
+
+    [[server.listeners]]
+    ip = "0.0.0.0"
+    port = 443
+    synlimit = "pf"
     ```
 ## synlimit_seconds (server.listeners)
   - **Constraints / validation**: `u32`, must be `> 0`. Default is `60`.
-  - **Description**: Generic SYN-fix token-bucket interval. The rate is `synlimit_hitcount / synlimit_seconds` and is rendered to native netfilter rate units (`second`, `minute`, `hour`, or `day`). This bucket handles SYN packets that do not match the iOS-like TTL/length classifier.
+  - **Description**: Generic SYN-fix token-bucket interval. For Linux backends, the rate is `synlimit_hitcount / synlimit_seconds` and is rendered to native netfilter rate units (`second`, `minute`, `hour`, or `day`). This bucket handles SYN packets that do not match the iOS-like TTL/length classifier. For PF, the same pair is rendered as `max-src-conn-rate hitcount/seconds`.
   - **Example**:
 
     ```toml
@@ -2386,7 +2433,7 @@ Note: This section also accepts the legacy alias `[server.admin_api]` (same sche
     ```
 ## synlimit_hitcount (server.listeners)
   - **Constraints / validation**: `u32`, must be `> 0`. Default is `48`.
-  - **Description**: Generic SYN-fix token-bucket rate amount. Together with `synlimit_seconds`, it defines the allowed source-IP SYN rate before excess SYN packets receive TCP RST.
+  - **Description**: Generic SYN-fix token-bucket rate amount. Together with `synlimit_seconds`, it defines the allowed source-IP SYN rate. Linux netfilter rejects excess SYN packets with TCP RST; PF silently drops excess state-creating packets.
   - **Example**:
 
     ```toml
@@ -2397,7 +2444,7 @@ Note: This section also accepts the legacy alias `[server.admin_api]` (same sche
     synlimit_hitcount = 48
     ```
 ## synlimit_burst (server.listeners)
-  - **Constraints / validation**: `u32`, must be `> 0`. Default is `1`.
+  - **Constraints / validation**: `u32`, must be `> 0`. Default is `24`.
   - **Description**: Generic SYN-fix token-bucket burst size. Higher values allow short connection bursts from the same source IP before the steady-state `synlimit_hitcount / synlimit_seconds` rate is enforced.
   - **Example**:
 
@@ -2406,7 +2453,7 @@ Note: This section also accepts the legacy alias `[server.admin_api]` (same sche
     ip = "0.0.0.0"
     port = 443
     synlimit = "iptables"
-    synlimit_burst = 1
+    synlimit_burst = 24
     ```
 ## synlimit_ios_seconds (server.listeners)
   - **Constraints / validation**: `u32`, must be `> 0`. Default is `1`.
@@ -2446,7 +2493,7 @@ Note: This section also accepts the legacy alias `[server.admin_api]` (same sche
     ```
 ## synlimit_hashlimit_expire_ms (server.listeners)
   - **Constraints / validation**: `u32`, must be `> 0`. Default is `60000`.
-  - **Description**: Entry expiration in milliseconds for iptables/ip6tables hashlimit buckets. nftables meters use kernel-managed state and do not expose this exact knob.
+  - **Description**: Entry expiration in milliseconds for iptables/ip6tables hashlimit buckets. nftables meters and PF source tracking use kernel-managed state and do not expose this exact knob.
   - **Example**:
 
     ```toml
@@ -2458,7 +2505,7 @@ Note: This section also accepts the legacy alias `[server.admin_api]` (same sche
     ```
 ## synlimit_hashlimit_size (server.listeners)
   - **Constraints / validation**: `u32`, must be `> 0`. Default is `32768`.
-  - **Description**: Hash table size for iptables/ip6tables hashlimit buckets. nftables meters use kernel-managed state and do not expose this exact knob.
+  - **Description**: Hash table size for iptables/ip6tables hashlimit buckets. nftables meters and PF source tracking use kernel-managed state and do not expose this exact knob.
   - **Example**:
 
     ```toml
@@ -2511,6 +2558,210 @@ Note: This section also accepts the legacy alias `[server.admin_api]` (same sche
     ip = "0.0.0.0"
     reuse_allow = false
     ```
+
+## transport (server.listeners)
+  - **Constraints / validation**: `"mtproxy"` or `"web"`.
+  - **Description**: Selects the protocol accepted by this listener. A WEB listener receives plain HTTP/1.1 from a trusted TLS terminator and is restart-required. It must set `proxy_protocol = false`, `reuse_allow = false`, and cannot use `client_mss`, `synlimit`, `announce`, or `announce_ip`.
+  - **Example**:
+
+    ```toml
+    [[server.listeners]]
+    ip = "127.0.0.1"
+    port = 18080
+    transport = "web"
+    proxy_protocol = false
+    web_trusted_proxy_cidrs = ["127.0.0.1/32"]
+    ```
+
+## web_client_ip_source (server.listeners)
+  - **Constraints / validation**: Only `"x_forwarded_for"` is supported by the initial WEB implementation.
+  - **Description**: Chooses the L7 source of the original client IP. From a direct TCP peer in `web_trusted_proxy_cidrs`, Telemt accepts one parseable `X-Forwarded-For` address. If the trusted peer omits the header, Telemt uses that peer's address; configure the terminator to set the header so per-client limits and source policy use the real client address.
+
+## web_trusted_proxy_cidrs (server.listeners)
+  - **Constraints / validation**: WEB-only non-empty CIDR array. A `/0` network is rejected. It is invalid on an MTProxy listener.
+  - **Description**: Trust boundary for the immediate NGINX or HAProxy peer. List only addresses that can connect directly to this listener; never expose the plain listener to an untrusted network.
+
+
+# [web]
+
+WEB mode carries Telegram Desktop MTProxy traffic through HTTPS terminated by an external NGINX or HAProxy. Telemt receives plain HTTP/1.1 on a private `transport = "web"` listener. See the [complete WEB deployment guide](../WEB/WEB_PROXY.en.md) before enabling this mode.
+
+| Key | Type | Default | Hot-Reload |
+| --- | --- | --- | --- |
+| `enabled` | `bool` | `false` | `✔` |
+| `carrier` | `"https"`, `"https-lanes"`, `"websocket"`, or `"websocket-lanes"` | `"https"` | `✔` |
+| `carriers` | `false` or a non-empty array of unique carriers | `false` | `✔` |
+| `carrier_learning` | `bool` | `true` | `✔` |
+| `carrier_negotiation_aggressiveness` | `"conservative"`, `"balanced"`, or `"aggressive"` | `"conservative"` | `✔` |
+| `decoy_fasttrack_mode` | `"off"`, `"shadow"`, or `"enforce"` | `"off"` | `✘` |
+| `http_connection_capacity_action` | `"drop"`, `"wait"`, or `"respond"` | `"drop"` | `✔` |
+| `debug` | table | disabled, bounded defaults | `✔` |
+| `limits` | table | bounded defaults | `✘` |
+| `timeouts` | table | bounded defaults | `✔` |
+| `vhosts` | array of tables | `[]` | `✔` |
+
+`enabled = true` requires at least one network-eligible WEB listener, at least one vhost, and at least one profile in every vhost. `https` preserves the serialized HTTPS transport and requires `max_http_handlers >= 2`. `https-lanes` gives stream zero and every logical stream independent uplink sequencing, downlink cursors, retries, and long polls; it requires `max_http_handlers >= 4` and public HTTP/2 on the TLS terminator. `websocket` carries all logical streams over one ordered RFC 6455 connection, while `websocket-lanes` owns one connection per non-zero logical stream and isolates lane failures. Both WebSocket carriers use `GET /api/v1/ws` after HTTPS session creation and require the TLS terminator to preserve HTTP/1.1 Upgrade headers.
+
+When `carriers` is missing or `false`, auto-negotiation and learning are disabled and `carrier` is the only mode. A non-empty `carriers` array enables startup-only negotiation in its configured order; `carrier` is appended exactly once as the final fallback. Empty arrays, duplicates, and `true` are rejected. The client advances candidates only before carrier commit and must create a new session to change carrier after commit. A metadata-free native client, including Telegram iOS, always uses the configured fixed `carrier`, even when negotiation is enabled. Current iOS supports only `https`, so such deployments must configure `carrier = "https"`. CFNetwork and Darwin User-Agent classification does not infer carrier support. Explicit native iOS capabilities are intersected with `{https}`; other explicit client capabilities participate as reported.
+
+`http_connection_capacity_action` applies only after Telemt has accepted a private WEB TCP connection and `max_http_connections` is exhausted. `drop` preserves the legacy immediate close. `respond` emits an empty `503 Service Unavailable` with `Retry-After: 1`, `Cache-Control: no-store`, and `Connection: close`. `wait` waits for ordinary connection capacity for at most `http_overload_timeout_ms`, then enters normal HTTP handling; timeout emits the same bounded `503`. At most `max_http_overload_connections` accepted sockets may wait or respond outside ordinary connection capacity. This policy cannot observe or cause a TCP connect refusal before Telemt accepts the socket.
+
+`decoy_fasttrack_mode` is restart-only. `off` preserves legacy root-request scanning and collects no fast-track decisions. `shadow` records eligible requests while preserving the full scan. `enforce` skips scans only for `HEAD` or absent/noncanonical bridge queries. A canonical bridge-shaped `GET`, including an unknown capability, always scans every profile in the selected vhost. The optimization does not bound hostile canonical probes and enforce mode must be validated for request-shape timing distinguishability behind the production TLS terminator.
+
+`carrier_learning` applies only while negotiation is enabled. Learning is process-local, in-memory, bounded, and positive-only: only a carrier that reaches the server-defined healthy state contributes evidence. `conservative` requires the broadest evidence and disables IP ranking, `balanced` admits moderate User-Agent/profile evidence plus eligible public-IP tie breaking, and `aggressive` reacts to the first bounded samples. Reported client failures remain diagnostic and never create negative evidence. Reload preserves evidence across a generation change only when enabled state, aggressiveness, evidence lifetime, and health window are identical; any semantic change advances the evidence epoch and fences stale outcomes. Because `[web.limits]` is process-owned, a reload that enables learning or negotiation using only a desired larger `max_carrier_learning_entries` atomically defers the dependent learning/carrier field rather than publishing an invalid effective combination. Disabling WEB stops issuance of new bridge and session credentials after reload; use the users API to revoke one user's active sessions.
+
+# [web.debug]
+
+This hot-reloadable table controls the process-owned server-side WEB debug recorder exposed as authenticated HTML at `GET /web-status` on the API listener. Collection is disabled by default. Retained and in-flight records remain bounded by restart-only values in `[web.limits]`.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled` | `bool` | `false` | Enables WEB HTTP, WebSocket-message, frame, and lifecycle debug records. |
+| `capture_lifecycle` | `bool` | `true` | Records typed bridge, session, stream, handshake, relay, and close events. |
+| `sideband` | `bool` | `false` | Enables generated-bridge lifecycle diagnostics; effective only when `enabled` and `capture_lifecycle` are also true. |
+| `capture_headers` | `bool` | `true` | Retains header names and only allowlisted non-credential values. |
+| `capture_timings` | `bool` | `true` | Retains request-body, response-ready, response-body, and WebSocket message-processing timing points. |
+| `capture_frames` | `bool` | `true` | Parses bounded carrier bodies into frame type, stream ID, length, WINDOW, and error metadata without retaining frame payload separately. |
+| `body_capture` | `"off"`, `"metadata"`, `"prefix"`, or `"full"` | `"metadata"` | Controls request and response body byte retention. |
+| `body_prefix_bytes` | `usize` | `4096` | Prefix retained for recognized WEB bodies in `prefix` mode. |
+| `decoy_body_prefix_bytes` | `usize` | `4096` | Maximum retained prefix for ordinary decoy traffic in both `prefix` and `full` modes. |
+| `default_window_secs` | `u64` | `180` | Default observation window rendered by `/web-status`. |
+| `max_window_secs` | `u64` | `3600` | Largest observation window accepted by `/web-status`; validated at no more than 86400. |
+
+Changing `enabled` or any capture field clears retained records and rejects commits started under the previous policy epoch. Changing only the default or maximum observation window preserves compatible retained records. `full` retains a complete recognized carrier body only up to `web.limits.max_body_bytes`; decoy bodies always remain prefix-bounded. A prefix that depends on a simultaneously increased restart-only capacity is deferred with `web.debug` until restart. URI queries are never retained, credential header values are omitted, body copies are scrubbed for known WEB capabilities and bearer tokens, and profile keys are represented only by a domain-separated 16-hex fingerprint.
+
+When `enabled`, `sideband`, and `capture_lifecycle` are all true, newly generated bridge pages send bounded one-shot lifecycle events to the exact configured base plus `api/v1/diagnostic`. The route is internal to Telemt and does not expose a public control API. Existing bridge documents do not acquire sideband behavior after reload.
+
+Authenticated JSON control may clear the ring explicitly with `POST /v1/runtime/web/debug/clear`; the required process `runtime_instance` fences stale controllers, the returned epoch fences in-flight writers, and `leased_bytes` reports memory still owned by already rendered snapshots.
+
+# [web.limits]
+
+These process-wide ceilings make every WEB registry, queue, request body, capability index, static snapshot, and admission path bounded. All values are validated together. Per-owner limits cannot exceed global limits, queue reserves must preserve control-frame progress, body reservations must fit their global budget, and all declared byte ceilings must fit `memory_envelope_bytes`. Changing any value in this table requires a process restart.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `max_header_bytes` | `usize` | `16384` | Maximum bytes in one HTTP request head. |
+| `max_body_bytes` | `usize` | `2097152` | Maximum collected carrier request body. |
+| `max_frame_payload_bytes` | `usize` | `1048576` | Maximum payload in one WEB frame. |
+| `carrier_batch_bytes` | `usize` | `2097152` | Maximum encoded downlink batch. |
+| `max_frames_per_body` | `usize` | `4096` | Maximum frames parsed or emitted per carrier body. |
+| `max_http_connections` | `usize` | `1024` | Accepted WEB HTTP connections process-wide. |
+| `max_http_overload_connections` | `usize` | `64` | Accepted saturated sockets allowed to wait or emit the bounded retryable response outside ordinary HTTP capacity. |
+| `max_http_handlers` | `usize` | `512` | Concurrent HTTP handlers process-wide; HTTPS lanes may park at most half, preserving the remainder for session, uplink, and control work. |
+| `max_lane_open_waits_per_session` | `usize` | `16` | Canonical cursor-zero downlink polls allowed to wait for a racing lane `OPEN` in one session. |
+| `pending_bytes_per_lane` | `usize` | `8388608` | Queued and resident `DATA` bytes allowed for one independent HTTPS or WebSocket lane. |
+| `pending_items_per_lane` | `usize` | `1024` | Queued and resident `DATA` items allowed for one independent HTTPS or WebSocket lane. |
+| `websocket_bytes_global` | `usize` | `268435456` | Transient WebSocket codec, message, and write-staging sub-budget inside `pending_bytes_global`. |
+| `websocket_admission_watermark_pct` | `u8` | `75` | WebSocket byte watermark for new base admission and the fair-share calculation used by deterministic replacement. |
+| `websocket_eviction_watermark_pct` | `u8` | `90` | WebSocket data-allocation watermark at which shared queue pressure may request deterministic cleanup. |
+| `websocket_http_connection_reserve` | `usize` | `64` | Accepted HTTP connections unavailable to WebSocket upgrades, preserving ordinary HTTP and decoy capacity. |
+| `max_websocket_evictions_in_flight` | `usize` | `8` | Process-wide ceiling for concurrent exact WebSocket eviction claims during admission and pressure cleanup. |
+| `max_carrier_learning_entries` | `usize` | `4096` | Process-wide ceiling for bounded carrier-learning evidence entries. |
+| `max_body_readers` | `usize` | `32` | Concurrent collected request bodies process-wide. |
+| `max_body_bytes_global` | `usize` | `67108864` | Global byte reservation for collected bodies. |
+| `max_sessions_global` | `usize` | `128` | Live WEB sessions process-wide. |
+| `max_sessions_per_ip` | `usize` | `16` | Live sessions for one forwarded client IP. |
+| `max_streams_per_session` | `usize` | `128` | Default live logical streams per session. |
+| `max_streams_global` | `usize` | `4096` | Live logical streams process-wide. |
+| `max_stream_handshakes` | `usize` | `256` | Concurrent inner MTProxy handshakes. |
+| `max_tombstones_per_session` | `usize` | `4096` | Closed stream IDs retained per session. |
+| `pending_bytes_per_session` | `usize` | `33554432` | Queued data and control bytes per session. |
+| `pending_bytes_global` | `usize` | `536870912` | Queued data and control bytes process-wide. |
+| `pending_items_per_session` | `usize` | `16384` | Queued data and control items per session. |
+| `pending_items_global` | `usize` | `262144` | Queued data and control items process-wide. |
+| `control_bytes_per_session` | `usize` | `262144` | Per-session byte reserve available only to control frames. |
+| `control_bytes_global` | `usize` | `16777216` | Process-wide byte reserve available only to control frames. |
+| `max_bootstraps_global` | `usize` | `512` | Live bootstrap credentials process-wide. |
+| `max_bootstraps_per_ip` | `usize` | `64` | Live bootstrap credentials per client IP. |
+| `max_vhosts` | `usize` | `8` | Configured WEB virtual hosts. |
+| `max_profiles` | `usize` | `32` | WEB profiles across all vhosts. |
+| `max_static_files` | `usize` | `4096` | Static snapshot entries across all vhosts. |
+| `max_static_file_bytes` | `usize` | `8388608` | Maximum bytes in one static file. |
+| `max_static_bytes` | `usize` | `67108864` | Static snapshot bytes across all vhosts. |
+| `debug_records_capacity` | `usize` | `65536` | Maximum retained WEB debug record count. |
+| `debug_bytes_global` | `usize` | `67108864` | Retained plus in-flight WEB debug byte ceiling; minimum 4096. |
+| `memory_envelope_bytes` | `usize` | `1342177280` | Declared envelope for HTTP heads, bodies, shared queues/WebSocket I/O, capability indexes, lane state, carrier learning, static snapshots, and bounded debug/status buffers; maximum 4 GiB. |
+| `new_bootstraps_per_minute` | `u32` | `1200` | Sustained process-wide bootstrap issuance rate. |
+| `new_bootstraps_burst` | `u32` | `256` | Process-wide bootstrap issuance burst. |
+| `new_sessions_per_minute` | `u32` | `600` | Sustained process-wide session creation rate. |
+| `new_sessions_burst` | `u32` | `128` | Process-wide session creation burst. |
+| `new_streams_per_minute` | `u32` | `6000` | Sustained logical-stream creation rate. |
+| `new_streams_burst` | `u32` | `512` | Process-wide logical-stream creation burst. |
+
+# [web.timeouts]
+
+Unless a row states otherwise, timeouts are measured in seconds and must be within `1..=3600`. Configured server-side HTTP phase deadlines must be lower than `http_idle_secs`; protected phases retain their own deadlines, so the idle timer is not an aggregate request deadline. The bridge retry window is client-side and follows its own bound.
+
+| Key | Type | Default | Hot-Reload | Description |
+| --- | --- | --- | --- | --- |
+| `header_secs` | `u64` | `10` | `✔` | Receive one complete HTTP request head. |
+| `body_secs` | `u64` | `30` | `✔` | Collect one authenticated carrier body. |
+| `stream_handshake_secs` | `u64` | `10` | `✔` | Complete one inner MTProxy handshake. |
+| `stream_first_byte_secs` | `u64` | `30` | `✔` | Receive the first inner MTProxy byte after `OPEN`; validated within `1..=300`. |
+| `long_poll_secs` | `u64` | `25` | `✔` | Maximum empty downlink long poll. |
+| `bridge_request_secs` | `u64` | `10` | `✔` | Bridge-side deadline for one HTTP attempt through complete response-body consumption; `/down` additionally allows `long_poll_secs`. Validated within `1..=60`. |
+| `bridge_retry_secs` | `u64` | `90` | `✔` | Absolute bridge retry window including attempts and backoff; validated within `1..=300` and no lower than `bridge_request_secs`. |
+| `bridge_recovery_secs` | `u64` | `15` | `✔` | Absolute post-commit recovery window for a surviving bridge document; validated within `1..=60` and frozen when recovery starts. |
+| `carrier_probe_coalesce_ms` | `u64` | `0` | `✔` | Optional bridge wait after `OPEN` for matching `DATA`; milliseconds within `0..=10`, where `0` preserves immediate probing. |
+| `lane_open_wait_secs` | `u64` | `2` | `✔` | Wait for a canonical cursor-zero downlink that races its lane `OPEN`; no greater than `long_poll_secs`. |
+| `carrier_health_secs` | `u64` | `30` | `✔` | Post-commit observation interval required before a carrier can contribute learning evidence. |
+| `websocket_upgrade_secs` | `u64` | `5` | `✔` | Maximum wait for an accepted HTTP Upgrade to become a WebSocket; validated within `1..=60`. |
+| `websocket_open_secs` | `u64` | `15` | `✔` | Absolute deadline for the first carrier binary message after Upgrade; validated within `1..=300`. |
+| `websocket_write_secs` | `u64` | `30` | `✔` | Maximum wait for one WebSocket write or flush. |
+| `websocket_backpressure_secs` | `u64` | `30` | `✔` | Maximum wait for shared byte-budget or queue progress before closing the affected connection. |
+| `websocket_eviction_secs` | `u64` | `1` | `✔` | Grace allowed for a pressure-evicted WebSocket to release its slot and budget before admission fails. |
+| `carrier_negotiation_deadlines_secs` | `[u64; 4]` | `[3, 5, 8, 12]` | `✔` | Strictly increasing cumulative offsets used by the bridge before its first `/session` request and by the server when accepting the first automatic attempt. Checkpoints for one through four candidates are `[d3]`, `[d0, d3]`, `[d0, d1, d3]`, and `[d0, d1, d2, d3]`; the final candidate always uses `d3`. |
+| `carrier_learning_secs` | `u64` | `600` | `✔` | Fixed two-window process-local evidence lifetime; validated within `2..=86400`. |
+| `bootstrap_lifetime_secs` | `u64` | `120` | `✔` | Unused bootstrap and closed-token replay lifetime. |
+| `reconnect_grace_secs` | `u64` | `120` | `✔` | Maximum validated peer inactivity before session closure; empty polls and backend-only progress do not renew this lease. |
+| `http_idle_secs` | `u64` | `75` | `✔` | Idle limit between HTTP exchanges and while an emitted response body makes no progress. Explicitly bounded request-body, long-poll, decoy, and pending-Upgrade phases keep their own deadlines instead of being truncated by this timer. The value is frozen when the connection is accepted. |
+| `http_overload_timeout_ms` | `u64` | `250` | `✔` | Per-phase deadline in milliseconds for an accepted saturated socket to wait for capacity or write its retryable response; validated within `1..=60000`. A timed-out wait and its response write each receive at most one phase budget. |
+| `shutdown_secs` | `u64` | `15` | `✔` | One absolute process-shutdown budget shared by all listener acceptors and connections plus WEB session and auxiliary-task drains. The active value is captured once when shutdown starts. |
+| `decoy_header_secs` | `u64` | `30` | `✔` | Connect and response-head deadline for an HTTP decoy. |
+
+# [[web.vhosts]]
+
+| Key | Type | Required | Hot-Reload | Description |
+| --- | --- | --- | --- | --- |
+| `host` | `String` | yes | `✔` | Unique, canonical lowercase ACE FQDN without port, path, credentials, or trailing dot. |
+| `base_path` | `String` | no | `✔` | Exact case-sensitive WEB prefix without leading or trailing slash; empty by default. At most 128 ASCII bytes in slash-separated `[A-Za-z0-9][A-Za-z0-9_-]*` segments. |
+| `public_addr` | `SocketAddr` | yes | `✔` | Concrete public IP on port `443`; used in the inner relay destination tuple. |
+| `decoy` | table | yes | `✔` | Ordinary-site fallback for unauthenticated or invalid traffic. |
+| `profiles` | array of tables | when enabled | `✔` | Explicit users and client secret modes exposed by this hostname. |
+
+The hostname must be accepted by Telegram Desktop and is normalized during validation. An empty `base_path` keeps the root v1 capability and legacy hexadecimal link secret. A non-empty path uses the v2 host/path capability and a Telegram Desktop path link with percent-encoded `HOST/BASE` plus the `0x70` base64url secret marker. Routing requires the exact slash-terminated prefix and never redirects, normalizes, or strips it. A bootstrap is a bearer credential: its client address and address family may change before session creation. An unused bootstrap remains valid across a configuration reload only while the same profile identity is still active.
+
+# [web.vhosts.decoy]
+
+Exactly one decoy mode is required:
+
+| Mode | Required keys | Validation |
+| --- | --- | --- |
+| `http_upstream` | `upstream` | An `http://` origin using a loopback, link-local, or private IP literal; no credentials, path, query, or fragment. |
+| `static_directory` | `directory`; optional `index = "index.html"` | Absolute real directory and one safe index file name. Symlinks and escaping paths are rejected; the immutable snapshot is loaded under `[web.limits]`. |
+
+# [[web.vhosts.profiles]]
+
+| Key | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `user` | `String` | yes | — | Existing 1–64-byte key from `[access.users]`; the bound keeps runtime status and filters bounded. |
+| `secret_mode` | `"plain"` or `"dd"` | yes | — | Exact Telegram Desktop secret representation. `ee` is not supported. |
+| `max_sessions` | `usize` | no | `web.limits.max_sessions_global` | Live sessions for this profile. |
+| `max_streams` | `usize` | no | `web.limits.max_streams_global` | Live logical streams for this profile. |
+| `max_streams_per_session` | `usize` | no | `web.limits.max_streams_per_session` | Live logical streams in one profile session. |
+
+Profile limits must be non-zero and no greater than their corresponding global limits. Duplicate `(user, secret_mode)` profiles in one vhost are rejected.
+
+## WEB lifecycle and API management
+
+- The config watcher and generation reload apply `web.enabled`, carrier and negotiation policy, `web.debug`, `web.timeouts`, vhosts, profiles, and decoy snapshots without a process restart. One immutable expanded source snapshot is validated and activated; a candidate generation's watcher starts only after that generation becomes active. Existing sessions and in-flight negotiation chains keep their issuance-time carrier candidates, limits, timeouts, and absolute deadlines; newly issued bridge sessions use one pinned active generation.
+- Changing `base_path` atomically replaces both the new-request route and derived capability. Reissue links and drain affected live sessions first: established WebSockets and already routed exchanges continue; later old-base requests carrying a process-authentic bootstrap or session token receive a local no-store `404`, while the now-inactive old capability follows ordinary decoy handling.
+- WEB listener inventory and trust policy under `server.listeners`, and every `web.limits` value, are process-owned and restart-required.
+- `GET /v1/config` returns the complete authored `[web]` tree except the derived `web.runtime` snapshot. `PATCH /v1/config` accepts a sparse `web` object, deep-merges tables, replaces arrays wholesale, validates the complete candidate, and reports `web.limits` in `deferred_process_fields` until restart.
+- `GET /v1/runtime/web/status`, `/sessions`, `/sessions/{session_ref}`, and `/operations/{operation_id}` expose bounded non-secret runtime state. POST controls close selected sessions, clear debug data, or reset carrier learning and require the current random `runtime_instance`.
+- `web.enabled = false` stops new bootstrap/session issuance after activation but does not close live sessions. For close-all, wait until status reports `manager.issuance_enabled = false`, submit the asynchronous `all` selector, and poll its operation.
+- Existing access users can be created, changed, rotated, enabled, disabled, and deleted through `/v1/users`. Creating a user does not add a WEB profile. Disabling a user immediately updates admission and cancels that user's active sessions.
+- `PATCH /v1/config` can persist `server.listeners`, including WEB listener fields, but a changed WEB listener does not become active until process restart.
 
 
 # [timeouts]
@@ -2632,8 +2883,10 @@ Note: This section also accepts the legacy alias `[server.admin_api]` (same sche
 | [`tls_fetch_scope`](#tls_fetch_scope) | `String` | `""` | `✘` |
 | [`tls_fetch`](#tls_fetch) | `Table` | built-in defaults | `✘` |
 | [`mask`](#mask) | `bool` | `true` | `✘` |
+| [`mask_dynamic`](#mask_dynamic) | `bool` | `true` | `✘` |
 | [`mask_host`](#mask_host) | `String` | — | `✘` |
 | [`mask_port`](#mask_port) | `u16` | `443` | `✘` |
+| [`exclusive_mask`](#exclusive_mask) | `Map<String, String>` | `{}` | `✘` |
 | [`mask_unix_sock`](#mask_unix_sock) | `String` | — | `✘` |
 | [`fake_cert_len`](#fake_cert_len) | `usize` | `2048` | `✘` |
 | [`tls_emulation`](#tls_emulation) | `bool` | `true` | `✘` |
@@ -2661,7 +2914,7 @@ Note: This section also accepts the legacy alias `[server.admin_api]` (same sche
 
 ## tls_domain
   - **Constraints / validation**: Must be a non-empty domain name. Must not contain spaces or `/`.
-  - **Description**: Primary domain used for Fake-TLS masking / fronting profile and as the default SNI domain presented to clients. 
+  - **Description**: Primary domain used for Fake-TLS masking / fronting profile and as the default SNI domain presented to clients.
     This value becomes part of generated `ee` links, and changing it invalidates previously generated links.
   - **Example**:
 
@@ -2721,11 +2974,20 @@ Note: This section also accepts the legacy alias `[server.admin_api]` (same sche
     [censorship]
     mask = true
     ```
+## mask_dynamic
+  - **Constraints / validation**: `bool`.
+  - **Description**: When neither `mask_host` nor `mask_unix_sock` is configured, use a matching ClientHello SNI from `tls_domain`/`tls_domains` as the TCP mask target; if none matches, fall back to the primary `tls_domain`. A matching `exclusive_mask` entry always takes precedence over ordinary targets.
+  - **Example**:
+
+    ```toml
+    [censorship]
+    mask_dynamic = true
+    ```
 ## mask_host
   - **Constraints / validation**: `String` (optional).
     - If `mask_unix_sock` is set, `mask_host` must be omitted (mutually exclusive).
-    - If `mask_host` is not set and `mask_unix_sock` is not set, Telemt defaults `mask_host` to `tls_domain`.
-  - **Description**: Upstream mask host for TLS fronting relay.
+    - If neither `mask_host` nor `mask_unix_sock` is set, `mask_dynamic` may select a matching configured SNI; otherwise Telemt falls back to `tls_domain`.
+  - **Description**: Explicit upstream mask host for TLS fronting relay. When present, it disables dynamic SNI target selection except for `exclusive_mask` overrides.
   - **Example**:
 
     ```toml
@@ -3239,8 +3501,9 @@ If your backend or network is very bandwidth-constrained, reduce cap first. If p
     user_max_tcp_conns_global_each = 200
 
     [access.user_max_tcp_conns]
-    alice = 500   # uses 500, not the global cap
-    # bob has no entry → uses 200
+    # Alice uses 500 rather than the global cap.
+    alice = 500
+    # Bob has no entry and therefore uses 200.
     ```
 ## user_expirations
   - **Constraints / validation**: `Map<String, DateTime<Utc>>`. Each value must be a valid RFC3339 / ISO-8601 datetime.
@@ -3258,7 +3521,8 @@ If your backend or network is very bandwidth-constrained, reduce cap first. If p
 
     ```toml
     [access.user_data_quota]
-    alice = 1073741824 # 1 GiB
+    # Alice receives a 1 GiB quota.
+    alice = 1073741824
     ```
 ## user_max_unique_ips
   - **Constraints / validation**: `Map<String, usize>`.
@@ -3340,7 +3604,7 @@ If your backend or network is very bandwidth-constrained, reduce cap first. If p
 
 
 ## user_rate_limits
-  - **Constraints / validation**: Table `username -> { up_bps, down_bps }`. At least one direction must be non-zero.
+  - **Constraints / validation**: Table `username -> { up_bps, down_bps }`. Each direction must be within `0..=100000000000`; `0` means unlimited for that direction, and at least one direction must be non-zero.
   - **Description**: Per-user bandwidth caps in bits/sec for upload (`up_bps`) and download (`down_bps`).
   - **Example**:
 
@@ -3349,7 +3613,7 @@ If your backend or network is very bandwidth-constrained, reduce cap first. If p
     alice = { up_bps = 1048576, down_bps = 2097152 }
     ```
 ## cidr_rate_limits
-  - **Constraints / validation**: Table `CIDR or auto-template -> { up_bps, down_bps }`. Explicit CIDR keys must parse as `IpNetwork`; auto-template keys must be `*4/N` (`N=0..32`), `*6/N` (`N=0..128`), or `*/N` (`N=0..32`). At least one direction must be non-zero. Duplicate normalized auto-templates are rejected.
+  - **Constraints / validation**: Table `CIDR or auto-template -> { up_bps, down_bps }`. Each direction must be within `0..=100000000000`; `0` means unlimited for that direction, and at least one direction must be non-zero. Explicit CIDR keys must parse as `IpNetwork`; auto-template keys must be `*4/N` (`N=0..32`), `*6/N` (`N=0..128`), or `*/N` (`N=0..32`). Duplicate normalized auto-templates are rejected.
   - **Description**: Source-subnet bandwidth caps applied alongside per-user limits. Explicit CIDR rules use longest-prefix-wins and take priority over auto-templates. Auto-templates create buckets lazily per matched source subnet: `*4/N` for IPv4, `*6/N` for IPv6, and `*/N` as a dual-stack shorthand where IPv4 uses `/N` and IPv6 uses `/(N * 4)`.
   - **Example**:
 
@@ -3478,7 +3742,8 @@ If your backend or network is very bandwidth-constrained, reduce cap first. If p
     [[upstreams]]
     type = "socks5"
     address = "203.0.113.10:1080"
-    interface = "192.0.2.10" # explicit local bind IP
+    # Use an explicit local bind IP.
+    interface = "192.0.2.10"
     ```
 ## bind_addresses
   - **Constraints / validation**: `String[]` (optional). Applies only to `type = "direct"`.

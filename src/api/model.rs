@@ -124,6 +124,10 @@ pub(super) struct ZeroCoreData {
     pub(super) conntrack_pressure_active: bool,
     pub(super) conntrack_event_queue_depth: u64,
     pub(super) conntrack_rule_apply_ok: bool,
+    pub(super) conntrack_rule_reconcile_success_total: u64,
+    pub(super) conntrack_rule_reconcile_error_total: u64,
+    pub(super) conntrack_rule_rollback_success_total: u64,
+    pub(super) conntrack_rule_rollback_error_total: u64,
     pub(super) conntrack_delete_attempt_total: u64,
     pub(super) conntrack_delete_success_total: u64,
     pub(super) conntrack_delete_not_found_total: u64,
@@ -211,6 +215,7 @@ pub(super) struct ZeroMiddleProxyData {
     pub(super) reconnect_success_total: u64,
     pub(super) handshake_reject_total: u64,
     pub(super) handshake_error_codes: Vec<ZeroCodeCount>,
+    pub(super) handshake_error_code_overflow_total: u64,
     pub(super) reader_eof_total: u64,
     pub(super) idle_close_by_peer_total: u64,
     pub(super) route_drop_no_conn_total: u64,
@@ -388,8 +393,11 @@ pub(super) struct MinimalDcPathData {
 pub(super) struct MinimalMeRuntimeData {
     pub(super) active_generation: u64,
     pub(super) warm_generation: u64,
+    pub(super) warm_generations: Vec<u64>,
     pub(super) pending_hardswap_generation: u64,
     pub(super) pending_hardswap_age_secs: Option<u64>,
+    pub(super) reinit_inflight: usize,
+    pub(super) reinit_max_concurrency_effective: usize,
     pub(super) hardswap_enabled: bool,
     pub(super) floor_mode: &'static str,
     pub(super) adaptive_floor_idle_secs: u64,
@@ -462,164 +470,6 @@ pub(super) struct MinimalAllData {
     pub(super) data: Option<MinimalAllPayload>,
 }
 
-#[derive(Serialize)]
-pub(super) struct UserLinks {
-    pub(super) classic: Vec<String>,
-    pub(super) secure: Vec<String>,
-    pub(super) tls: Vec<String>,
-    pub(super) tls_domains: Vec<TlsDomainLink>,
-}
-
-#[derive(Serialize)]
-pub(super) struct TlsDomainLink {
-    pub(super) domain: String,
-    pub(super) link: String,
-}
-
-#[derive(Serialize)]
-pub(super) struct UserInfo {
-    pub(super) username: String,
-    pub(super) enabled: bool,
-    pub(super) in_runtime: bool,
-    pub(super) user_ad_tag: Option<String>,
-    pub(super) max_tcp_conns: Option<usize>,
-    pub(super) expiration_rfc3339: Option<String>,
-    pub(super) data_quota_bytes: Option<u64>,
-    pub(super) rate_limit_up_bps: Option<u64>,
-    pub(super) rate_limit_down_bps: Option<u64>,
-    pub(super) max_unique_ips: Option<usize>,
-    pub(super) current_connections: u64,
-    pub(super) active_unique_ips: usize,
-    pub(super) active_unique_ips_list: Vec<IpAddr>,
-    pub(super) recent_unique_ips: usize,
-    pub(super) recent_unique_ips_list: Vec<IpAddr>,
-    pub(super) total_octets: u64,
-    pub(super) links: UserLinks,
-}
-
-#[derive(Serialize)]
-pub(super) struct UserActiveIps {
-    pub(super) username: String,
-    pub(super) active_ips: Vec<IpAddr>,
-}
-
-#[derive(Serialize)]
-pub(super) struct CreateUserResponse {
-    pub(super) user: UserInfo,
-    pub(super) secret: String,
-}
-
-#[derive(Serialize)]
-pub(super) struct DeleteUserResponse {
-    pub(super) username: String,
-    pub(super) in_runtime: bool,
-}
-
-#[derive(Serialize)]
-pub(super) struct ResetUserQuotaResponse {
-    pub(super) username: String,
-    pub(super) used_bytes: u64,
-    pub(super) last_reset_epoch_secs: u64,
-}
-
-#[derive(Serialize)]
-pub(super) struct UserQuotaListData {
-    pub(super) users: Vec<UserQuotaEntry>,
-}
-
-#[derive(Serialize)]
-pub(super) struct UserQuotaEntry {
-    pub(super) username: String,
-    pub(super) data_quota_bytes: u64,
-    pub(super) used_bytes: u64,
-    pub(super) last_reset_epoch_secs: u64,
-}
-
-#[derive(Deserialize)]
-pub(super) struct CreateUserRequest {
-    pub(super) username: String,
-    pub(super) secret: Option<String>,
-    pub(super) user_ad_tag: Option<String>,
-    pub(super) max_tcp_conns: Option<usize>,
-    pub(super) expiration_rfc3339: Option<String>,
-    pub(super) data_quota_bytes: Option<u64>,
-    pub(super) rate_limit_up_bps: Option<u64>,
-    pub(super) rate_limit_down_bps: Option<u64>,
-    pub(super) max_unique_ips: Option<usize>,
-    pub(super) enabled: Option<bool>,
-}
-
-#[derive(Deserialize)]
-pub(super) struct PatchUserRequest {
-    pub(super) secret: Option<String>,
-    #[serde(default, deserialize_with = "patch_field")]
-    pub(super) user_ad_tag: Patch<String>,
-    #[serde(default, deserialize_with = "patch_field")]
-    pub(super) max_tcp_conns: Patch<usize>,
-    #[serde(default, deserialize_with = "patch_field")]
-    pub(super) expiration_rfc3339: Patch<String>,
-    #[serde(default, deserialize_with = "patch_field")]
-    pub(super) data_quota_bytes: Patch<u64>,
-    #[serde(default, deserialize_with = "patch_field")]
-    pub(super) rate_limit_up_bps: Patch<u64>,
-    #[serde(default, deserialize_with = "patch_field")]
-    pub(super) rate_limit_down_bps: Patch<u64>,
-    #[serde(default, deserialize_with = "patch_field")]
-    pub(super) max_unique_ips: Patch<usize>,
-    #[serde(default, deserialize_with = "patch_field")]
-    pub(super) enabled: Patch<bool>,
-}
-
-#[derive(Default, Deserialize)]
-pub(super) struct RotateSecretRequest {
-    pub(super) secret: Option<String>,
-}
-
-pub(super) fn parse_optional_expiration(
-    value: Option<&str>,
-) -> Result<Option<DateTime<Utc>>, ApiFailure> {
-    let Some(raw) = value else {
-        return Ok(None);
-    };
-    let parsed = DateTime::parse_from_rfc3339(raw)
-        .map_err(|_| ApiFailure::bad_request("expiration_rfc3339 must be valid RFC3339"))?;
-    Ok(Some(parsed.with_timezone(&Utc)))
-}
-
-pub(super) fn parse_patch_expiration(
-    value: &Patch<String>,
-) -> Result<Patch<DateTime<Utc>>, ApiFailure> {
-    match value {
-        Patch::Unchanged => Ok(Patch::Unchanged),
-        Patch::Remove => Ok(Patch::Remove),
-        Patch::Set(raw) => {
-            let parsed = DateTime::parse_from_rfc3339(raw)
-                .map_err(|_| ApiFailure::bad_request("expiration_rfc3339 must be valid RFC3339"))?;
-            Ok(Patch::Set(parsed.with_timezone(&Utc)))
-        }
-    }
-}
-
-pub(super) fn is_valid_user_secret(secret: &str) -> bool {
-    secret.len() == 32 && secret.chars().all(|c| c.is_ascii_hexdigit())
-}
-
-pub(super) fn is_valid_ad_tag(tag: &str) -> bool {
-    tag.len() == 32 && tag.chars().all(|c| c.is_ascii_hexdigit())
-}
-
-pub(super) fn is_valid_username(user: &str) -> bool {
-    !user.is_empty()
-        && user.len() <= MAX_USERNAME_LEN
-        && user
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
-}
-
-pub(super) fn random_user_secret() -> String {
-    static API_SECRET_RNG: OnceLock<SecureRandom> = OnceLock::new();
-    let rng = API_SECRET_RNG.get_or_init(SecureRandom::new);
-    let mut bytes = [0u8; 16];
-    rng.fill(&mut bytes);
-    hex::encode(bytes)
-}
+// User-management request, response, and validation models.
+mod users;
+pub(super) use users::*;

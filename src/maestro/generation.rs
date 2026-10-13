@@ -3,13 +3,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use tokio::sync::{RwLock, Semaphore, watch};
+use tokio::sync::{Notify, RwLock, Semaphore, watch};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::config::ProxyConfig;
 use crate::crypto::SecureRandom;
 use crate::ip_tracker::UserIpTracker;
+use crate::proxy::authenticated::ClientRuntimeDeps;
 #[cfg(test)]
 use crate::proxy::route_mode::RelayRouteMode;
 use crate::proxy::route_mode::RouteRuntimeController;
@@ -21,6 +22,11 @@ use crate::tls_front::TlsFrontCache;
 use crate::transport::UpstreamManager;
 use crate::transport::middle_proxy::MePool;
 
+// Cancellation guards preserve runtime ownership across preparation and drain futures.
+mod lifecycle;
+pub(crate) use lifecycle::RuntimeTaskScopePreparationGuard;
+use lifecycle::SessionDrainCancellationGuard;
+
 const SESSION_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKGROUND_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const SESSION_ADMISSION_CLOSED: usize = 1 << (usize::BITS - 1);
@@ -28,6 +34,7 @@ const SESSION_REGISTRATION_COUNT: usize = SESSION_ADMISSION_CLOSED - 1;
 
 struct SessionAdmission {
     state: AtomicUsize,
+    registrations_drained: Notify,
 }
 
 struct SessionRegistration<'a> {
@@ -38,6 +45,7 @@ impl SessionAdmission {
     fn new() -> Self {
         Self {
             state: AtomicUsize::new(0),
+            registrations_drained: Notify::new(),
         }
     }
 
@@ -72,15 +80,24 @@ impl SessionAdmission {
     }
 
     async fn wait_for_registrations(&self) {
-        while self.state.load(Ordering::Acquire) & SESSION_REGISTRATION_COUNT != 0 {
-            tokio::task::yield_now().await;
+        loop {
+            let notified = self.registrations_drained.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.state.load(Ordering::Acquire) & SESSION_REGISTRATION_COUNT == 0 {
+                return;
+            }
+            notified.await;
         }
     }
 }
 
 impl Drop for SessionRegistration<'_> {
     fn drop(&mut self) {
-        self.admission.state.fetch_sub(1, Ordering::Release);
+        let previous = self.admission.state.fetch_sub(1, Ordering::AcqRel);
+        if previous & SESSION_REGISTRATION_COUNT == 1 {
+            self.admission.registrations_drained.notify_waiters();
+        }
     }
 }
 
@@ -97,6 +114,7 @@ pub(crate) struct RuntimeWatchState {
 pub(crate) struct RuntimeTaskScope {
     tracker: TaskTracker,
     cancel: CancellationToken,
+    admission: Arc<SessionAdmission>,
 }
 
 impl RuntimeTaskScope {
@@ -105,6 +123,7 @@ impl RuntimeTaskScope {
         Self {
             tracker: TaskTracker::new(),
             cancel: CancellationToken::new(),
+            admission: Arc::new(SessionAdmission::new()),
         }
     }
 
@@ -113,9 +132,13 @@ impl RuntimeTaskScope {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        let Some(_registration) = self.admission.try_register() else {
+            return;
+        };
         let cancel = self.cancel.clone();
         self.tracker.spawn(async move {
             tokio::select! {
+                biased;
                 _ = cancel.cancelled() => {}
                 _ = future => {}
             }
@@ -127,10 +150,17 @@ impl RuntimeTaskScope {
         self.cancel.clone()
     }
 
-    /// Cancels the scope and waits within the bounded background-task budget.
-    pub(crate) async fn stop(&self) {
+    /// Synchronously closes task admission and signals every tracked task.
+    pub(crate) fn begin_stop(&self) {
+        self.admission.close();
         self.cancel.cancel();
         self.tracker.close();
+    }
+
+    /// Cancels the scope and waits within the bounded background-task budget.
+    pub(crate) async fn stop(&self) {
+        self.begin_stop();
+        self.admission.wait_for_registrations().await;
         let _ = tokio::time::timeout(BACKGROUND_STOP_TIMEOUT, self.tracker.wait()).await;
     }
 }
@@ -227,22 +257,47 @@ impl RuntimeGeneration {
         self.me_pool_runtime.read().await.clone()
     }
 
+    /// Pins all dependencies required by a client stream without retaining the generation.
+    pub(crate) fn client_runtime_deps(&self) -> ClientRuntimeDeps {
+        ClientRuntimeDeps {
+            config: self.config(),
+            stats: Arc::clone(&self.stats),
+            upstream_manager: Arc::clone(&self.upstream_manager),
+            buffer_pool: Arc::clone(&self.buffer_pool),
+            rng: Arc::clone(&self.rng),
+            me_pool: self.me_pool.clone(),
+            me_pool_runtime: Some(Arc::clone(&self.me_pool_runtime)),
+            route_runtime: Arc::clone(&self.route_runtime),
+            ip_tracker: Arc::clone(&self.ip_tracker),
+            shared: Arc::clone(&self.proxy_shared),
+        }
+    }
+
     /// Registers a session only while admission remains open.
     pub(crate) fn spawn_session<F>(&self, future: F) -> bool
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        self.try_spawn_session(future).is_ok()
+    }
+
+    /// Registers one session or returns its unpolled future to the caller.
+    pub(crate) fn try_spawn_session<F>(&self, future: F) -> Result<(), F>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
         let Some(_registration) = self.session_admission.try_register() else {
-            return false;
+            return Err(future);
         };
         let cancel = self.session_cancel.clone();
         self.sessions.spawn(async move {
             tokio::select! {
+                biased;
                 _ = cancel.cancelled() => {}
                 _ = future => {}
             }
         });
-        true
+        Ok(())
     }
 
     /// Closes admission while preserving already registered sessions.
@@ -250,32 +305,34 @@ impl RuntimeGeneration {
         self.session_admission.close();
     }
 
-    /// Reopens admission after a candidate activation rolls back.
-    pub(crate) fn resume_accepting_sessions(&self) {
-        self.session_admission.reopen();
-    }
-
     /// Waits for registered sessions and cancels them when the deadline expires.
     pub(crate) async fn drain_sessions(&self, timeout: Duration) -> bool {
         self.stop_accepting_sessions();
+        let mut cancellation_guard = SessionDrainCancellationGuard::new(self);
         self.session_admission.wait_for_registrations().await;
         self.sessions.close();
         if tokio::time::timeout(timeout, self.sessions.wait())
             .await
             .is_ok()
         {
+            cancellation_guard.disarm();
             return true;
         }
+        cancellation_guard.disarm();
         self.stop_sessions().await;
         false
     }
 
-    /// Cancels all sessions and waits within the bounded session-stop budget.
-    pub(crate) async fn stop_sessions(&self) {
+    fn begin_stop_sessions(&self) {
         self.stop_accepting_sessions();
-        self.session_admission.wait_for_registrations().await;
         self.session_cancel.cancel();
         self.sessions.close();
+    }
+
+    /// Cancels all sessions and waits within the bounded session-stop budget.
+    pub(crate) async fn stop_sessions(&self) {
+        self.begin_stop_sessions();
+        self.session_admission.wait_for_registrations().await;
         let _ = tokio::time::timeout(SESSION_STOP_TIMEOUT, self.sessions.wait()).await;
     }
 
@@ -283,13 +340,46 @@ impl RuntimeGeneration {
     pub(crate) async fn stop_background_tasks(&self) {
         self.background_tasks.stop().await;
     }
+
+    /// Terminally stops the generation's Middle-End task and writer scope.
+    pub(crate) async fn stop_middle_end(&self, timeout: Duration) -> bool {
+        let Some(pool) = self.current_me_pool().await else {
+            return true;
+        };
+        pool.shutdown_until(timeout).await
+    }
+}
+
+impl Drop for RuntimeGeneration {
+    fn drop(&mut self) {
+        self.background_tasks.begin_stop();
+        self.begin_stop_sessions();
+        if let Some(pool) = self.me_pool.as_ref() {
+            pool.begin_shutdown();
+        }
+        if let Ok(pool) = self.me_pool_runtime.try_read()
+            && let Some(pool) = pool.as_ref()
+        {
+            pool.begin_shutdown();
+        }
+    }
 }
 
 #[cfg(test)]
 /// Builds a lightweight runtime generation without network startup tasks.
-pub(super) fn test_runtime_generation(id: u64, config: ProxyConfig) -> Arc<RuntimeGeneration> {
-    let (config_tx, config_rx) = watch::channel(Arc::new(config.clone()));
+pub(crate) fn test_runtime_generation(id: u64, config: ProxyConfig) -> Arc<RuntimeGeneration> {
     let (_admission_tx, admission_rx) = watch::channel(true);
+    test_runtime_generation_with_admission(id, config, admission_rx)
+}
+
+#[cfg(test)]
+/// Builds a lightweight runtime generation with a controllable admission gate.
+pub(crate) fn test_runtime_generation_with_admission(
+    id: u64,
+    config: ProxyConfig,
+    admission_rx: watch::Receiver<bool>,
+) -> Arc<RuntimeGeneration> {
+    let (config_tx, config_rx) = watch::channel(Arc::new(config.clone()));
     let stats = Arc::new(Stats::new());
     let upstream_manager = Arc::new(UpstreamManager::new(
         config.upstreams,
@@ -358,11 +448,31 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_task_scope_joins_cancelled_background_task() {
+        struct DropSignal(Arc<AtomicUsize>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
         let scope = RuntimeTaskScope::new();
-        scope.spawn(std::future::pending());
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let drop_signal = DropSignal(dropped.clone());
+        scope.spawn(async move {
+            let _drop_signal = drop_signal;
+            std::future::pending::<()>().await;
+        });
         tokio::time::timeout(Duration::from_secs(1), scope.stop())
             .await
             .unwrap();
+        assert_eq!(dropped.load(Ordering::Acquire), 1);
+
+        let late_drop_signal = DropSignal(dropped.clone());
+        scope.spawn(async move {
+            let _late_drop_signal = late_drop_signal;
+        });
+        assert_eq!(dropped.load(Ordering::Acquire), 2);
     }
 
     #[tokio::test]

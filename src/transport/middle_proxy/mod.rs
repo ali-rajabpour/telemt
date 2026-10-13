@@ -22,6 +22,7 @@ mod ping;
 mod pool;
 mod pool_config;
 mod pool_init;
+mod pool_lifecycle;
 mod pool_nat;
 mod pool_refill;
 #[cfg(test)]
@@ -31,6 +32,9 @@ mod pool_reinit;
 mod pool_runtime_api;
 mod pool_status;
 mod pool_writer;
+#[cfg(test)]
+#[path = "tests/pool_writer_publication_tests.rs"]
+mod pool_writer_publication_tests;
 #[cfg(test)]
 #[path = "tests/pool_writer_security_tests.rs"]
 mod pool_writer_security_tests;
@@ -44,6 +48,11 @@ mod send;
 #[path = "tests/send_adversarial_tests.rs"]
 mod send_adversarial_tests;
 mod wire;
+
+/// Network-free writer fixtures shared by admission and recovery regressions.
+#[cfg(test)]
+#[path = "tests/admission_test_support.rs"]
+pub(crate) mod admission_test_support;
 
 use bytes::Bytes;
 use tokio::sync::OwnedSemaphorePermit;
@@ -62,6 +71,8 @@ pub use ping::{
 pub use pool::MePool;
 #[allow(unused_imports)]
 pub use pool_nat::{detect_public_ip, stun_probe};
+pub(crate) use pool_status::MeApiHardswapSnapshot;
+pub(crate) use registry::ConnLease;
 pub use registry::ConnRegistry;
 pub use rotation::{MeReinitTrigger, me_reinit_scheduler, me_rotation_task};
 #[allow(unused_imports)]

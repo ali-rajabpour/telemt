@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tracing::{debug, info};
@@ -9,7 +11,8 @@ use tracing::{debug, info};
 use crate::error::{ProxyError, Result};
 use crate::network::probe::{detect_public_ipv4_http, is_bogon};
 use crate::network::stun::{
-    IpFamily, stun_probe_dual_with_tcp_fallback, stun_probe_family_with_bind_and_tcp_fallback,
+    IpFamily, stun_probe_dual_with_tcp_fallback,
+    stun_probe_family_with_bind_tcp_fallback_and_resolver,
 };
 
 use super::MePool;
@@ -17,7 +20,21 @@ use std::time::Instant;
 
 const STUN_BATCH_TIMEOUT: Duration = Duration::from_secs(5);
 const STUN_BATCH_TCP_FALLBACK_TIMEOUT: Duration = Duration::from_secs(12);
+const STUN_CACHE_TTL: Duration = Duration::from_secs(600);
+const HTTP_FAILURE_TTL: Duration = Duration::from_secs(60);
 
+// Discovery ownership and source-bound cache admission for this pool generation.
+mod state;
+pub(super) use state::NatDiscovery;
+// Successful HTTP observations expire independently of failure backoff.
+mod http;
+pub(super) use http::HttpNatObservation;
+
+// Local network regressions exercise cancellation before discovery publication.
+#[cfg(test)]
+mod tests;
+
+/// Probes the configured or default STUN endpoint with both address families.
 #[allow(dead_code)]
 pub async fn stun_probe(stun_addr: Option<String>) -> Result<crate::network::stun::DualStunResult> {
     let stun_addr = stun_addr.unwrap_or_else(|| {
@@ -34,6 +51,7 @@ pub async fn stun_probe(stun_addr: Option<String>) -> Result<crate::network::stu
     stun_probe_dual_with_tcp_fallback(&stun_addr, false).await
 }
 
+/// Detects a public IPv4 address using the default HTTP endpoints.
 #[allow(dead_code)]
 pub async fn detect_public_ip() -> Option<IpAddr> {
     let urls = crate::config::defaults::default_http_ip_detect_urls();
@@ -66,10 +84,12 @@ impl MePool {
         let mut best_by_ip: HashMap<IpAddr, (usize, std::net::SocketAddr)> = HashMap::new();
         let concurrency = self.nat_runtime.nat_probe_concurrency.max(1);
         let tcp_fallback = self.nat_runtime.stun_tcp_fallback;
+        let dns_resolver = self.upstream.as_ref().map(|manager| manager.dns_resolver());
 
         while next_idx < servers.len() || !join_set.is_empty() {
             while next_idx < servers.len() && join_set.len() < concurrency {
                 let stun_addr = servers[next_idx].clone();
+                let dns_resolver = dns_resolver.clone();
                 next_idx += 1;
                 join_set.spawn(async move {
                     let batch_timeout = if tcp_fallback {
@@ -79,11 +99,12 @@ impl MePool {
                     };
                     let res = timeout(
                         batch_timeout,
-                        stun_probe_family_with_bind_and_tcp_fallback(
+                        stun_probe_family_with_bind_tcp_fallback_and_resolver(
                             &stun_addr,
                             family,
                             bind_ip,
                             tcp_fallback,
+                            dns_resolver.as_deref(),
                         ),
                     )
                     .await;
@@ -147,15 +168,18 @@ impl MePool {
         (live_servers, best_reflected)
     }
 
+    /// Applies the configured or HTTP-detected NAT IP to non-public addresses.
     pub(super) fn translate_ip_for_nat(&self, ip: IpAddr) -> IpAddr {
-        let nat_ip = self.nat_runtime.nat_ip_cfg.or_else(|| {
+        Self::translate_ip_with_nat(
+            ip,
             self.nat_runtime
-                .nat_ip_detected
-                .try_read()
-                .ok()
-                .and_then(|g| *g)
-        });
+                .nat_ip_cfg
+                .or_else(|| self.cached_http_nat_ip()),
+        )
+    }
 
+    /// Applies a captured NAT observation without rereading mutable discovery state.
+    pub(super) fn translate_ip_with_nat(ip: IpAddr, nat_ip: Option<IpAddr>) -> IpAddr {
         let Some(nat_ip) = nat_ip else {
             return ip;
         };
@@ -173,10 +197,21 @@ impl MePool {
         }
     }
 
+    /// Selects the NAT source IP without replacing the actual TCP source port.
     pub(super) fn translate_our_addr_with_reflection(
         &self,
         addr: std::net::SocketAddr,
         reflected: Option<std::net::SocketAddr>,
+    ) -> std::net::SocketAddr {
+        self.translate_our_addr_with_nat(addr, reflected, self.cached_http_nat_ip())
+    }
+
+    /// Retains the actual TCP port while using one handshake-local NAT snapshot.
+    pub(super) fn translate_our_addr_with_nat(
+        &self,
+        addr: std::net::SocketAddr,
+        reflected: Option<std::net::SocketAddr>,
+        detected: Option<IpAddr>,
     ) -> std::net::SocketAddr {
         let ip = if let Some(nat_ip) = self.nat_runtime.nat_ip_cfg {
             match (addr.ip(), nat_ip) {
@@ -189,130 +224,98 @@ impl MePool {
             if is_bogon(addr.ip()) || addr.ip().is_loopback() || addr.ip().is_unspecified() {
                 r.ip()
             } else {
-                self.translate_ip_for_nat(addr.ip())
+                Self::translate_ip_with_nat(addr.ip(), detected)
             }
         } else {
-            self.translate_ip_for_nat(addr.ip())
+            Self::translate_ip_with_nat(addr.ip(), detected)
         };
 
         // Keep the kernel-assigned TCP source port; STUN port can differ.
         std::net::SocketAddr::new(ip, addr.port())
     }
 
-    pub(super) async fn maybe_detect_nat_ip(&self, local_ip: IpAddr) -> Option<IpAddr> {
-        if self.nat_runtime.nat_ip_cfg.is_some() {
-            return self.nat_runtime.nat_ip_cfg;
-        }
-
-        if !self.nat_runtime.nat_probe {
-            return None;
-        }
-
-        if !(is_bogon(local_ip) || local_ip.is_loopback() || local_ip.is_unspecified()) {
-            return None;
-        }
-
-        if let Some(ip) = *self.nat_runtime.nat_ip_detected.read().await {
-            return Some(ip);
-        }
-
-        let Some(ip) = detect_public_ipv4_http(&self.nat_runtime.http_ip_detect_urls).await else {
-            return None;
-        };
-        {
-            let mut guard = self.nat_runtime.nat_ip_detected.write().await;
-            *guard = Some(IpAddr::V4(ip));
-        }
-        info!(public_ip = %ip, "Auto-detected public IP for NAT translation");
-        Some(IpAddr::V4(ip))
-    }
-
+    /// Waits for a pool-owned STUN refresh in the exact source-address context.
     pub(super) async fn maybe_reflect_public_addr(
-        &self,
+        self: &Arc<Self>,
         family: IpFamily,
         bind_ip: Option<IpAddr>,
     ) -> Option<std::net::SocketAddr> {
-        const STUN_CACHE_TTL: Duration = Duration::from_secs(600);
-        let use_shared_cache = bind_ip.is_none();
-        if !use_shared_cache {
-            match (family, bind_ip) {
-                (IpFamily::V4, Some(IpAddr::V4(_)))
-                | (IpFamily::V6, Some(IpAddr::V6(_)))
-                | (_, None) => {}
-                _ => return None,
-            }
+        if let Some(bind_ip) = bind_ip {
+            return self.reflect_bound_addr(family, bind_ip).await;
         }
-        // Backoff window
-        if use_shared_cache
-            && let Some(until) = *self.nat_runtime.stun_backoff_until.read().await
-            && Instant::now() < until
-        {
-            if let Ok(cache) = self.nat_runtime.nat_reflection_cache.try_lock() {
-                let slot = match family {
-                    IpFamily::V4 => cache.v4,
-                    IpFamily::V6 => cache.v6,
-                };
-                return slot.map(|(_, addr)| addr);
-            }
-            return None;
+        if let Some(cached) = self.cached_shared_reflection(family).await {
+            return cached;
+        }
+        let singleflight = match family {
+            IpFamily::V4 => self.nat_runtime.nat_reflection_singleflight_v4.clone(),
+            IpFamily::V6 => self.nat_runtime.nat_reflection_singleflight_v6.clone(),
+        };
+        let flight = singleflight.lock_owned().await;
+        if let Some(cached) = self.cached_shared_reflection(family).await {
+            return cached;
         }
 
-        if use_shared_cache && let Ok(mut cache) = self.nat_runtime.nat_reflection_cache.try_lock()
-        {
-            let slot = match family {
-                IpFamily::V4 => &mut cache.v4,
-                IpFamily::V6 => &mut cache.v6,
-            };
-            if let Some((ts, addr)) = slot
-                && ts.elapsed() < STUN_CACHE_TTL
-            {
-                return Some(*addr);
-            }
-        }
-
-        let _singleflight_guard = if use_shared_cache {
-            Some(match family {
-                IpFamily::V4 => self.nat_runtime.nat_reflection_singleflight_v4.lock().await,
-                IpFamily::V6 => self.nat_runtime.nat_reflection_singleflight_v6.lock().await,
+        let pool = self.clone();
+        let (send, receive) = oneshot::channel();
+        self.lifecycle
+            .spawn_producer(async move {
+                let _flight = flight;
+                let attempt = pool
+                    .nat_runtime
+                    .nat_probe_attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let reflected = pool.refresh_stun(family, None, attempt).await;
+                if let Some(addr) = reflected {
+                    // Cache readers must never cause a completed refresh to be discarded.
+                    let mut cache = pool.nat_runtime.nat_reflection_cache.lock().await;
+                    let slot = match family {
+                        IpFamily::V4 => &mut cache.v4,
+                        IpFamily::V6 => &mut cache.v6,
+                    };
+                    *slot = Some((Instant::now(), addr));
+                    pool.nat_runtime
+                        .nat_probe_attempts
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    let backoff = Duration::from_secs(60 * 2u64.pow((attempt as u32).min(6)));
+                    *pool.nat_runtime.stun_backoff_until.write().await =
+                        Some(Instant::now() + backoff);
+                }
+                let _ = send.send(reflected);
             })
-        } else {
-            None
+            .ok()?;
+        receive.await.ok().flatten()
+    }
+
+    async fn cached_shared_reflection(
+        &self,
+        family: IpFamily,
+    ) -> Option<Option<std::net::SocketAddr>> {
+        let backoff = self
+            .nat_runtime
+            .stun_backoff_until
+            .read()
+            .await
+            .is_some_and(|until| Instant::now() < until);
+        let cache = self.nat_runtime.nat_reflection_cache.lock().await;
+        let slot = match family {
+            IpFamily::V4 => cache.v4,
+            IpFamily::V6 => cache.v6,
         };
-
-        if use_shared_cache
-            && let Some(until) = *self.nat_runtime.stun_backoff_until.read().await
-            && Instant::now() < until
-        {
-            if let Ok(cache) = self.nat_runtime.nat_reflection_cache.try_lock() {
-                let slot = match family {
-                    IpFamily::V4 => cache.v4,
-                    IpFamily::V6 => cache.v6,
-                };
-                return slot.map(|(_, addr)| addr);
-            }
-            return None;
+        // Preserve the existing stale-result fallback during shared failure backoff.
+        if backoff {
+            return Some(slot.map(|(_, addr)| addr));
         }
+        slot.filter(|(created, _)| created.elapsed() < STUN_CACHE_TTL)
+            .map(|(_, addr)| Some(addr))
+    }
 
-        if use_shared_cache && let Ok(mut cache) = self.nat_runtime.nat_reflection_cache.try_lock()
-        {
-            let slot = match family {
-                IpFamily::V4 => &mut cache.v4,
-                IpFamily::V6 => &mut cache.v6,
-            };
-            if let Some((ts, addr)) = slot
-                && ts.elapsed() < STUN_CACHE_TTL
-            {
-                return Some(*addr);
-            }
-        }
-
-        let attempt = if use_shared_cache {
-            self.nat_runtime
-                .nat_probe_attempts
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        } else {
-            0
-        };
+    async fn refresh_stun(
+        &self,
+        family: IpFamily,
+        bind_ip: Option<IpAddr>,
+        attempt: u8,
+    ) -> Option<std::net::SocketAddr> {
         let configured_servers = self.configured_stun_servers();
         let live_snapshot = self.nat_runtime.nat_stun_live_servers.read().await.clone();
         let primary_servers = if live_snapshot.is_empty() {
@@ -344,32 +347,13 @@ impl MePool {
         }
 
         if let Some(reflected_addr) = selected_reflected {
-            if use_shared_cache {
-                self.nat_runtime
-                    .nat_probe_attempts
-                    .store(0, std::sync::atomic::Ordering::Relaxed);
-            }
             info!(
                 family = ?family,
                 live_servers = live_server_count,
                 "STUN-Quorum reached, IP: {}",
                 reflected_addr.ip()
             );
-            if use_shared_cache
-                && let Ok(mut cache) = self.nat_runtime.nat_reflection_cache.try_lock()
-            {
-                let slot = match family {
-                    IpFamily::V4 => &mut cache.v4,
-                    IpFamily::V6 => &mut cache.v6,
-                };
-                *slot = Some((Instant::now(), reflected_addr));
-            }
             return Some(reflected_addr);
-        }
-
-        if use_shared_cache {
-            let backoff = Duration::from_secs(60 * 2u64.pow((attempt as u32).min(6)));
-            *self.nat_runtime.stun_backoff_until.write().await = Some(Instant::now() + backoff);
         }
         None
     }

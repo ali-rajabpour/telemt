@@ -59,6 +59,8 @@
 )]
 
 pub mod adaptive_buffers;
+// Shared authenticated admission and relay orchestration for TCP and WEB streams.
+pub(crate) mod authenticated;
 pub mod client;
 // Process-wide Direct relay copy-buffer ownership and pressure policy.
 pub(crate) mod direct_buffer_budget;
@@ -71,6 +73,9 @@ pub mod route_mode;
 pub mod session_eviction;
 pub mod shared_state;
 pub mod traffic_limiter;
+pub(crate) mod user_admission;
+// Process-wide per-user connection admission remains independent from telemetry.
+pub(crate) mod user_connection_authority;
 
 pub use client::ClientHandler;
 #[allow(unused_imports)]

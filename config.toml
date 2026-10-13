@@ -58,4 +58,6 @@ tls_front_dir = "tlsfront"   # Cache directory for TLS emulation
 
 [access.users]
 # format: "username" = "32_hex_chars_secret"
-hello = "00000000000000000000000000000000"
+# Generate a secret with: openssl rand -hex 16
+# No default user: upstream's sample `hello` user has a public all-zero secret,
+# so anyone could use the proxy. Add users here or via TELEMT_ACCESS__USERS__<NAME>.

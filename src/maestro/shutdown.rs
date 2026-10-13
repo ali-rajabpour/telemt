@@ -8,7 +8,7 @@
 //!
 //! SIGHUP is handled separately in config/hot_reload.rs for config reload.
 
-use std::path::PathBuf;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -19,9 +19,12 @@ use tokio::signal;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{info, warn};
 
+use super::control_plane::ProcessControlPlane;
 use super::generation::RuntimeGeneration;
 use super::helpers::{format_uptime, unit_label};
 use super::reload_supervisor::ReloadSupervisorHandle;
+use crate::conntrack_control::FirewallAuthority;
+use crate::quota_state::QuotaStateOwner;
 use crate::stats::Stats;
 use crate::synlimit_control;
 
@@ -50,18 +53,20 @@ impl std::fmt::Display for ShutdownSignal {
 pub(crate) async fn wait_for_shutdown(
     process_started_at: Instant,
     active_runtime: Arc<ArcSwap<RuntimeGeneration>>,
-    quota_state_path: PathBuf,
-    synlimit_controller: synlimit_control::SynlimitController,
+    quota_state: Arc<QuotaStateOwner>,
     reload_supervisor: ReloadSupervisorHandle,
+    conntrack_firewall: Option<FirewallAuthority>,
+    process_control_plane: ProcessControlPlane,
 ) {
     let signal = wait_for_shutdown_signal().await;
     perform_shutdown(
         signal,
         process_started_at,
         active_runtime,
-        quota_state_path,
-        synlimit_controller,
+        quota_state,
         reload_supervisor,
+        conntrack_firewall,
+        process_control_plane,
     )
     .await;
 }
@@ -91,14 +96,15 @@ async fn perform_shutdown(
     signal: ShutdownSignal,
     process_started_at: Instant,
     active_runtime: Arc<ArcSwap<RuntimeGeneration>>,
-    quota_state_path: PathBuf,
-    synlimit_controller: synlimit_control::SynlimitController,
+    quota_state: Arc<QuotaStateOwner>,
     reload_supervisor: ReloadSupervisorHandle,
+    conntrack_firewall: Option<FirewallAuthority>,
+    process_control_plane: ProcessControlPlane,
 ) {
     let shutdown_started_at = Instant::now();
     info!(signal = %signal, "Received shutdown signal");
 
-    reload_supervisor.quiesce().await;
+    let listener_manager = reload_supervisor.quiesce().await;
     let runtime = active_runtime.load_full();
     let stats = runtime.stats.as_ref();
 
@@ -111,41 +117,51 @@ async fn perform_shutdown(
     let uptime_secs = process_started_at.elapsed().as_secs();
     info!("Uptime: {}", format_uptime(uptime_secs));
 
+    if let Err(error) = listener_manager.lock().await.shutdown().await {
+        warn!(error = %error, "Failed to stop one or more listener tasks cleanly");
+    }
+
     // Graceful ME pool shutdown
     runtime.stop_sessions().await;
     runtime.stop_background_tasks().await;
-    if let Some(pool) = runtime.current_me_pool().await {
-        match tokio::time::timeout(Duration::from_secs(2), pool.shutdown_send_close_conn_all())
-            .await
-        {
-            Ok(total) => {
-                info!(
-                    close_conn_sent = total,
-                    "ME shutdown: RPC_CLOSE_CONN broadcast completed"
-                );
-            }
-            Err(_) => {
-                warn!("ME shutdown: RPC_CLOSE_CONN broadcast timed out");
-            }
-        }
+    if runtime.stop_middle_end(Duration::from_secs(5)).await {
+        info!("ME shutdown: pool lifecycle completed");
+    } else {
+        warn!("ME shutdown: pool lifecycle deadline expired");
     }
 
-    synlimit_controller.shutdown().await;
+    if let Some(conntrack_firewall) = conntrack_firewall
+        && !conntrack_firewall.shutdown_and_clear().await
+    {
+        warn!("Conntrack firewall cleanup did not complete successfully");
+    }
+
     if let Err(error) = synlimit_control::clear_synlimit_rules_all_backends().await {
         warn!(error = %error, "Failed to clear SYN limiter rules during shutdown");
     }
 
-    match crate::quota_state::save_quota_state(&quota_state_path, stats).await {
+    if !process_control_plane.shutdown(Duration::from_secs(5)).await {
+        warn!("Process control-plane task shutdown deadline expired");
+    }
+
+    let configured_quota_users = runtime
+        .config()
+        .access
+        .users
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    match quota_state.save(&configured_quota_users).await {
         Ok(()) => {
             info!(
-                path = %quota_state_path.display(),
+                path = %quota_state.path().display(),
                 "Persisted per-user quota state"
             );
         }
         Err(error) => {
             warn!(
                 error = %error,
-                path = %quota_state_path.display(),
+                path = %quota_state.path().display(),
                 "Failed to persist per-user quota state"
             );
         }
@@ -205,8 +221,9 @@ fn dump_stats(stats: &Stats, process_started_at: Instant) {
 pub(crate) fn spawn_signal_handlers(
     active_runtime: Arc<ArcSwap<RuntimeGeneration>>,
     process_started_at: Instant,
+    process_control_plane: ProcessControlPlane,
 ) {
-    tokio::spawn(async move {
+    let _ = process_control_plane.spawn(async move {
         let mut sigusr1 =
             signal(SignalKind::user_defined1()).expect("Failed to register SIGUSR1 handler");
         let mut sigusr2 =
@@ -231,6 +248,7 @@ pub(crate) fn spawn_signal_handlers(
 pub(crate) fn spawn_signal_handlers(
     _active_runtime: Arc<ArcSwap<RuntimeGeneration>>,
     _process_started_at: Instant,
+    _process_control_plane: ProcessControlPlane,
 ) {
     // No SIGUSR1/SIGUSR2 on non-Unix
 }

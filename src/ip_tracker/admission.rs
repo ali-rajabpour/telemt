@@ -2,26 +2,84 @@ use super::*;
 
 impl UserIpTracker {
     pub async fn set_limit_policy(&self, mode: UserMaxUniqueIpsMode, window_secs: u64) {
-        self.limit_mode
-            .store(Self::mode_to_u8(mode), Ordering::Relaxed);
-        self.limit_window_secs
-            .store(window_secs.max(1), Ordering::Relaxed);
+        let _policy_update = self.policy_update.lock().unwrap_or_else(|poisoned| {
+            self.policy_update.clear_poison();
+            poisoned.into_inner()
+        });
+        let current = self.limit_policy.load_full();
+        self.limit_policy.store(Arc::new(UserIpLimitPolicy {
+            mode,
+            window_secs: window_secs.max(1),
+            ..(*current).clone()
+        }));
     }
 
     pub async fn set_user_limit(&self, username: &str, max_ips: usize) {
-        self.max_ips.insert(username.to_string(), max_ips);
+        let _policy_update = self.policy_update.lock().unwrap_or_else(|poisoned| {
+            self.policy_update.clear_poison();
+            poisoned.into_inner()
+        });
+        let current = self.limit_policy.load_full();
+        let mut limits = current.max_ips.as_ref().clone();
+        limits.insert(username.to_string(), max_ips);
+        self.limit_policy.store(Arc::new(UserIpLimitPolicy {
+            max_ips: Arc::new(limits),
+            ..(*current).clone()
+        }));
     }
 
     pub async fn remove_user_limit(&self, username: &str) {
-        self.max_ips.remove(username);
+        let _policy_update = self.policy_update.lock().unwrap_or_else(|poisoned| {
+            self.policy_update.clear_poison();
+            poisoned.into_inner()
+        });
+        let current = self.limit_policy.load_full();
+        let mut limits = current.max_ips.as_ref().clone();
+        limits.remove(username);
+        self.limit_policy.store(Arc::new(UserIpLimitPolicy {
+            max_ips: Arc::new(limits),
+            ..(*current).clone()
+        }));
     }
 
     pub async fn load_limits(&self, default_limit: usize, limits: &HashMap<String, usize>) {
-        self.default_max_ips.store(default_limit, Ordering::Relaxed);
-        self.max_ips.clear();
-        for (username, limit) in limits {
-            self.max_ips.insert(username.clone(), *limit);
+        let _policy_update = self.policy_update.lock().unwrap_or_else(|poisoned| {
+            self.policy_update.clear_poison();
+            poisoned.into_inner()
+        });
+        let current = self.limit_policy.load_full();
+        self.limit_policy.store(Arc::new(UserIpLimitPolicy {
+            max_ips: Arc::new(limits.clone()),
+            default_max_ips: default_limit,
+            ..(*current).clone()
+        }));
+    }
+
+    /// Atomically publishes one coherent policy from the active runtime generation.
+    pub(crate) async fn apply_policy_from_source(
+        &self,
+        source_generation: u64,
+        default_limit: usize,
+        limits: &HashMap<String, usize>,
+        mode: UserMaxUniqueIpsMode,
+        window_secs: u64,
+    ) -> bool {
+        let _policy_update = self.policy_update.lock().unwrap_or_else(|poisoned| {
+            self.policy_update.clear_poison();
+            poisoned.into_inner()
+        });
+        let current = self.limit_policy.load_full();
+        if source_generation < current.source_generation {
+            return false;
         }
+        self.limit_policy.store(Arc::new(UserIpLimitPolicy {
+            source_generation,
+            max_ips: Arc::new(limits.clone()),
+            default_max_ips: default_limit,
+            mode,
+            window_secs: window_secs.max(1),
+        }));
+        true
     }
 
     pub(super) fn prune_recent(
@@ -38,15 +96,49 @@ impl UserIpTracker {
     }
 
     pub async fn check_and_add(&self, username: &str, ip: IpAddr) -> Result<(), String> {
+        self.check_and_add_for_incarnation(username, 0, ip).await
+    }
+
+    /// Reserves an IP slot for one exact user incarnation.
+    pub(crate) async fn check_and_add_for_incarnation(
+        &self,
+        username: &str,
+        incarnation: UserIncarnation,
+        ip: IpAddr,
+    ) -> Result<(), String> {
         self.drain_cleanup_for_user(username).await;
-        self.maybe_compact_empty_users().await;
-        let limit = self.user_limit(username);
-        let mode = Self::mode_from_u8(self.limit_mode.load(Ordering::Relaxed));
-        let window = self.limit_window();
+        let policy = self.limit_policy.load();
+        let limit = Self::user_limit(&policy, username);
+        let mode = policy.mode;
+        let window = Self::limit_window(&policy);
         let now = Instant::now();
 
         let shard_idx = Self::shard_idx(username);
         let mut shard = self.shards[shard_idx].write().await;
+        if let Some(current) = shard.incarnations.get(username).copied() {
+            if current > incarnation {
+                return Err(format!(
+                    "IP tracker rejected stale user incarnation for '{username}'"
+                ));
+            }
+            if current < incarnation {
+                let removed_active = shard
+                    .active_ips
+                    .remove(username)
+                    .map(|ips| ips.len())
+                    .unwrap_or(0);
+                let removed_recent = shard
+                    .recent_ips
+                    .remove(username)
+                    .map(|ips| ips.len())
+                    .unwrap_or(0);
+                Self::decrement_counter(&self.active_entry_count, removed_active);
+                Self::decrement_counter(&self.recent_entry_count, removed_recent);
+                shard.incarnations.insert(username.to_string(), incarnation);
+            }
+        } else {
+            shard.incarnations.insert(username.to_string(), incarnation);
+        }
         let user_active = shard.active_ips.entry(username.to_string()).or_default();
         let active_contains_ip = user_active.contains_key(&ip);
         let active_len = user_active.len();
@@ -152,9 +244,21 @@ impl UserIpTracker {
     }
 
     pub async fn remove_ip(&self, username: &str, ip: IpAddr) {
-        self.maybe_compact_empty_users().await;
+        self.remove_ip_for_incarnation(username, 0, ip).await;
+    }
+
+    /// Releases an IP slot only from the incarnation that acquired it.
+    pub(crate) async fn remove_ip_for_incarnation(
+        &self,
+        username: &str,
+        incarnation: UserIncarnation,
+        ip: IpAddr,
+    ) {
         let shard_idx = Self::shard_idx(username);
         let mut shard = self.shards[shard_idx].write().await;
+        if shard.incarnations.get(username).copied() != Some(incarnation) {
+            return;
+        }
         let mut removed_active_entries = 0usize;
         if let Some(user_ips) = shard.active_ips.get_mut(username) {
             if let Some(count) = user_ips.get_mut(&ip) {

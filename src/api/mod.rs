@@ -1,5 +1,6 @@
 #![allow(clippy::too_many_arguments)]
 
+use std::collections::BTreeSet;
 use std::io::{Error as IoError, ErrorKind};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -16,25 +17,31 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, RwLock, Semaphore, watch};
+use tokio::sync::{Mutex, RwLock, Semaphore, oneshot, watch};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
-use crate::config::ApiGrayAction;
+use crate::config::{ApiGrayAction, ProxyConfig};
 use crate::ip_tracker::UserIpTracker;
+use crate::maestro::control_plane::ProcessControlPlane;
 use crate::maestro::generation::{RuntimeGeneration, RuntimeWatchState};
 use crate::maestro::reload::{ReloadAccepted, ReloadControl, ReloadRequest, ReloadSubmitError};
 use crate::proxy::route_mode::RouteRuntimeController;
 use crate::proxy::shared_state::ProxySharedState;
+use crate::quota_state::QuotaStateOwner;
 use crate::startup::StartupTracker;
 use crate::stats::Stats;
 use crate::transport::UpstreamManager;
 use crate::transport::middle_proxy::MePool;
+use crate::web::control::WebRuntimePublication;
+use crate::web::trace::WebTraceStore;
 
 mod config_edit;
 pub(crate) mod config_store;
 mod events;
 mod http_utils;
+// Authenticated request admission and route dispatch.
+mod handler;
 mod model;
 mod patch;
 #[cfg(test)]
@@ -47,19 +54,22 @@ mod runtime_stats;
 mod runtime_watch;
 mod runtime_zero;
 mod users;
+// WEB runtime status and bounded controls remain separate from general API DTOs.
+mod web_runtime;
+mod web_status;
 
 use config_store::{
-    current_revision, ensure_expected_revision, load_config_for_reload, load_config_from_disk,
+    current_revision, load_config_for_mutation, load_config_for_reload, load_config_from_disk,
     parse_if_match,
 };
 use events::ApiEventStore;
+use handler::handle;
 use http_utils::{error_response, read_json, read_optional_json, success_response};
 use model::{
     ApiFailure, ClassCount, CreateUserRequest, DeleteUserResponse, HealthData, HealthReadyData,
     PatchUserRequest, ResetUserQuotaResponse, RotateSecretRequest, SummaryData, UserActiveIps,
     is_valid_username,
 };
-use patch::Patch;
 use runtime_edge::{
     EdgeConnectionsCacheEntry, build_runtime_connections_summary_data,
     build_runtime_events_recent_data, build_runtime_tls_fingerprints_data,
@@ -107,7 +117,7 @@ pub(super) struct ApiShared {
     pub(super) me_pool: Arc<RwLock<Option<Arc<MePool>>>>,
     pub(super) upstream_manager: Arc<UpstreamManager>,
     pub(super) config_path: PathBuf,
-    pub(super) quota_state_path: PathBuf,
+    pub(super) quota_state: Arc<QuotaStateOwner>,
     pub(super) detected_ips_rx: watch::Receiver<(Option<IpAddr>, Option<IpAddr>)>,
     pub(super) mutation_lock: Arc<Mutex<()>>,
     pub(super) minimal_cache: Arc<Mutex<Option<MinimalCacheEntry>>>,
@@ -122,6 +132,9 @@ pub(super) struct ApiShared {
     pub(super) proxy_shared: Arc<ProxySharedState>,
     pub(super) reload_control: ReloadControl,
     pub(super) active_runtime: Arc<ArcSwap<RuntimeGeneration>>,
+    pub(super) web_trace: Arc<WebTraceStore>,
+    pub(super) web_runtime_rx: watch::Receiver<WebRuntimePublication>,
+    pub(super) control_plane: ProcessControlPlane,
 }
 
 impl ApiShared {
@@ -140,7 +153,7 @@ impl ApiShared {
             me_pool: runtime.me_pool_runtime.clone(),
             upstream_manager: runtime.upstream_manager.clone(),
             config_path: self.config_path.clone(),
-            quota_state_path: self.quota_state_path.clone(),
+            quota_state: self.quota_state.clone(),
             detected_ips_rx: self.detected_ips_rx.clone(),
             mutation_lock: self.mutation_lock.clone(),
             minimal_cache: self.minimal_cache.clone(),
@@ -155,7 +168,33 @@ impl ApiShared {
             proxy_shared: runtime.proxy_shared.clone(),
             reload_control: self.reload_control.clone(),
             active_runtime: self.active_runtime.clone(),
+            web_trace: self.web_trace.clone(),
+            web_runtime_rx: self.web_runtime_rx.clone(),
+            control_plane: self.control_plane.clone(),
         }
+    }
+
+    /// Keeps an accepted mutation alive until persistence and mandatory publication finish.
+    async fn run_mutation_completion<T, F>(&self, future: F) -> Result<T, ApiFailure>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = Result<T, ApiFailure>> + Send + 'static,
+    {
+        let (result_tx, result_rx) = oneshot::channel();
+        self.control_plane
+            .spawn_completion(async move {
+                let _ = result_tx.send(future.await);
+            })
+            .map_err(|_| {
+                ApiFailure::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "control_plane_shutting_down",
+                    "Control plane is shutting down",
+                )
+            })?;
+        result_rx.await.map_err(|_| {
+            ApiFailure::internal("accepted config mutation did not report completion")
+        })?
     }
 }
 
@@ -192,9 +231,15 @@ async fn submit_reload_from_disk(
     request: ReloadRequest,
 ) -> Result<(ReloadAccepted, String), ApiFailure> {
     let _guard = mutation_lock.lock().await;
-    ensure_expected_revision(config_path, expected_revision).await?;
-    let revision = current_revision(config_path).await?;
-    let config = Arc::new(load_config_for_reload(config_path).await?);
+    let (config, revision) = load_config_for_reload(config_path).await?;
+    if expected_revision.is_some_and(|expected| expected != revision) {
+        return Err(ApiFailure::new(
+            StatusCode::CONFLICT,
+            "revision_conflict",
+            "Config revision mismatch",
+        ));
+    }
+    let config = Arc::new(config);
     let accepted = reload_control
         .submit(config, revision.clone(), request)
         .await
@@ -214,6 +259,9 @@ async fn submit_reload_from_disk(
 }
 
 fn allowed_methods_for_path(path: &str) -> Option<&'static str> {
+    if let Some(allow) = web_runtime::allowed_methods(path) {
+        return Some(allow);
+    }
     match path {
         "/v1/health"
         | "/v1/health/ready"
@@ -243,7 +291,8 @@ fn allowed_methods_for_path(path: &str) -> Option<&'static str> {
         | "/v1/runtime/tls-fingerprints"
         | "/v1/stats/users/active-ips"
         | "/v1/stats/users/quota"
-        | "/v1/stats/users" => Some(ALLOW_GET),
+        | "/v1/stats/users"
+        | "/web-status" => Some(ALLOW_GET),
         "/v1/system/reload" => Some(ALLOW_POST),
         "/v1/users" => Some(ALLOW_GET_POST),
         "/v1/config" => Some(ALLOW_GET_PATCH),
@@ -263,8 +312,9 @@ fn allowed_methods_for_path(path: &str) -> Option<&'static str> {
     }
 }
 
-pub async fn serve(
-    listen: SocketAddr,
+/// Serves the API on a process-owned listener and task scope.
+pub(crate) async fn serve(
+    listener: TcpListener,
     stats: Arc<Stats>,
     ip_tracker: Arc<UserIpTracker>,
     me_pool: Arc<RwLock<Option<Arc<MePool>>>>,
@@ -272,13 +322,16 @@ pub async fn serve(
     proxy_shared: Arc<ProxySharedState>,
     upstream_manager: Arc<UpstreamManager>,
     config_path: PathBuf,
-    quota_state_path: PathBuf,
+    quota_state: Arc<QuotaStateOwner>,
     detected_ips_rx: watch::Receiver<(Option<IpAddr>, Option<IpAddr>)>,
     process_started_at_epoch_secs: u64,
     startup_tracker: Arc<StartupTracker>,
     reload_control: ReloadControl,
     mut active_runtime_rx: watch::Receiver<Option<Arc<ArcSwap<RuntimeGeneration>>>>,
     mut runtime_watch_rx: watch::Receiver<Option<RuntimeWatchState>>,
+    web_trace: Arc<WebTraceStore>,
+    web_runtime_rx: watch::Receiver<WebRuntimePublication>,
+    control_plane: ProcessControlPlane,
 ) {
     let active_runtime = loop {
         if let Some(active_runtime) = active_runtime_rx.borrow().clone() {
@@ -300,19 +353,9 @@ pub async fn serve(
     };
     let config_rx = initial_watch_state.config_rx.clone();
     let admission_rx = initial_watch_state.admission_rx.clone();
-    let listener = match TcpListener::bind(listen).await {
-        Ok(listener) => listener,
-        Err(error) => {
-            warn!(
-                error = %error,
-                listen = %listen,
-                "Failed to bind API listener"
-            );
-            return;
-        }
-    };
+    let listen = listener.local_addr().ok();
 
-    info!("API endpoint: http://{}/v1/*", listen);
+    info!(listen = ?listen, "API endpoint ready at /v1/* and /web-status");
 
     let runtime_state = Arc::new(ApiRuntimeState {
         process_started_at_epoch_secs,
@@ -327,7 +370,7 @@ pub async fn serve(
         me_pool,
         upstream_manager,
         config_path,
-        quota_state_path,
+        quota_state,
         detected_ips_rx,
         mutation_lock: Arc::new(Mutex::new(())),
         minimal_cache: Arc::new(Mutex::new(None)),
@@ -344,12 +387,16 @@ pub async fn serve(
         proxy_shared,
         reload_control,
         active_runtime,
+        web_trace,
+        web_runtime_rx,
+        control_plane: control_plane.clone(),
     });
 
     spawn_runtime_watchers(
         runtime_watch_rx,
         runtime_state.clone(),
         shared.runtime_events.clone(),
+        &control_plane,
     );
 
     let connection_permits = Arc::new(Semaphore::new(API_MAX_CONTROL_CONNECTIONS));
@@ -376,7 +423,7 @@ pub async fn serve(
         };
 
         let shared_conn = shared.clone();
-        tokio::spawn(async move {
+        let _ = control_plane.spawn(async move {
             let _connection_permit = connection_permit;
             let svc = service_fn(move |req: Request<Incoming>| {
                 let shared_req = shared_conn.clone();
@@ -403,808 +450,5 @@ pub async fn serve(
                 }
             }
         });
-    }
-}
-
-async fn handle(
-    req: Request<Incoming>,
-    peer: SocketAddr,
-    shared: Arc<ApiShared>,
-) -> Result<Response<Full<Bytes>>, IoError> {
-    let runtime = shared.active_runtime.load_full();
-    let previous_cache_generation = shared.cache_generation.swap(runtime.id, Ordering::AcqRel);
-    if previous_cache_generation != runtime.id {
-        *shared.minimal_cache.lock().await = None;
-        *shared.runtime_edge_connections_cache.lock().await = None;
-    }
-    let shared = Arc::new(shared.for_runtime(runtime.as_ref()));
-    let config_rx = runtime.config_rx.clone();
-    shared
-        .runtime_state
-        .admission_open
-        .store(*runtime.admission_rx.borrow(), Ordering::Relaxed);
-    let request_id = shared.next_request_id();
-    let cfg = config_rx.borrow().clone();
-    let api_cfg = &cfg.server.api;
-
-    if !api_cfg.enabled {
-        return Ok(error_response(
-            request_id,
-            ApiFailure::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "api_disabled",
-                "API is disabled",
-            ),
-        ));
-    }
-
-    if !api_cfg.whitelist.is_empty() && !api_cfg.whitelist.iter().any(|net| net.contains(peer.ip()))
-    {
-        return match api_cfg.gray_action {
-            ApiGrayAction::Api => Ok(error_response(
-                request_id,
-                ApiFailure::new(
-                    StatusCode::FORBIDDEN,
-                    "forbidden",
-                    "Source IP is not allowed",
-                ),
-            )),
-            ApiGrayAction::Ok200 => Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", "text/html; charset=utf-8")
-                .body(Full::new(Bytes::new()))
-                .unwrap()),
-            ApiGrayAction::Drop => Err(IoError::new(
-                ErrorKind::ConnectionAborted,
-                "api request dropped by gray_action=drop",
-            )),
-        };
-    }
-
-    if !api_cfg.auth_header.is_empty() {
-        let auth_ok = req
-            .headers()
-            .get(AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .map(|v| auth_header_matches(v, &api_cfg.auth_header))
-            .unwrap_or(false);
-        if !auth_ok {
-            return Ok(error_response(
-                request_id,
-                ApiFailure::new(
-                    StatusCode::UNAUTHORIZED,
-                    "unauthorized",
-                    "Missing or invalid Authorization header",
-                ),
-            ));
-        }
-    }
-
-    let method = req.method().clone();
-    let path = req.uri().path().to_string();
-    let normalized_path = if path.len() > 1 {
-        path.trim_end_matches('/')
-    } else {
-        path.as_str()
-    };
-    let query = req.uri().query().map(str::to_string);
-    let body_limit = api_cfg.request_body_limit_bytes;
-
-    let result: Result<Response<Full<Bytes>>, ApiFailure> = async {
-        match (method.as_str(), normalized_path) {
-            ("GET", "/v1/health") => {
-                let revision = current_revision(&shared.config_path).await?;
-                let data = HealthData {
-                    status: "ok",
-                    read_only: api_cfg.read_only,
-                };
-                Ok(success_response(StatusCode::OK, data, revision))
-            }
-            ("GET", "/v1/health/ready") => {
-                let revision = current_revision(&shared.config_path).await?;
-                let admission_open = shared.runtime_state.admission_open.load(Ordering::Relaxed);
-                let upstream_health = shared.upstream_manager.api_health_summary().await;
-                let ready = admission_open && upstream_health.healthy_total > 0;
-                let reason = if ready {
-                    None
-                } else if !admission_open {
-                    Some("admission_closed")
-                } else {
-                    Some("no_healthy_upstreams")
-                };
-                let data = HealthReadyData {
-                    ready,
-                    status: if ready { "ready" } else { "not_ready" },
-                    reason,
-                    admission_open,
-                    healthy_upstreams: upstream_health.healthy_total,
-                    total_upstreams: upstream_health.configured_total,
-                };
-                let status_code = if ready {
-                    StatusCode::OK
-                } else {
-                    StatusCode::SERVICE_UNAVAILABLE
-                };
-                Ok(success_response(status_code, data, revision))
-            }
-            ("GET", "/v1/system/info") => {
-                let revision = current_revision(&shared.config_path).await?;
-                let data = build_system_info_data(shared.as_ref(), cfg.as_ref(), &revision);
-                Ok(success_response(StatusCode::OK, data, revision))
-            }
-            ("GET", "/v1/runtime/gates") => {
-                let revision = current_revision(&shared.config_path).await?;
-                let data = build_runtime_gates_data(shared.as_ref(), cfg.as_ref()).await;
-                Ok(success_response(StatusCode::OK, data, revision))
-            }
-            ("GET", "/v1/runtime/initialization") => {
-                let revision = current_revision(&shared.config_path).await?;
-                let data = build_runtime_initialization_data(shared.as_ref()).await;
-                Ok(success_response(StatusCode::OK, data, revision))
-            }
-            ("GET", "/v1/limits/effective") => {
-                let revision = current_revision(&shared.config_path).await?;
-                let data = build_limits_effective_data(cfg.as_ref());
-                Ok(success_response(StatusCode::OK, data, revision))
-            }
-            ("GET", "/v1/security/posture") => {
-                let revision = current_revision(&shared.config_path).await?;
-                let data = build_security_posture_data(cfg.as_ref());
-                Ok(success_response(StatusCode::OK, data, revision))
-            }
-            ("GET", "/v1/security/whitelist") => {
-                let revision = current_revision(&shared.config_path).await?;
-                let data = build_security_whitelist_data(cfg.as_ref());
-                Ok(success_response(StatusCode::OK, data, revision))
-            }
-            ("GET", "/v1/stats/summary") => {
-                let revision = current_revision(&shared.config_path).await?;
-                let connections_bad_by_class = shared
-                    .stats
-                    .get_connects_bad_class_counts()
-                    .into_iter()
-                    .map(|(class, total)| ClassCount { class, total })
-                    .collect();
-                let handshake_failures_by_class = shared
-                    .stats
-                    .get_handshake_failure_class_counts()
-                    .into_iter()
-                    .map(|(class, total)| ClassCount { class, total })
-                    .collect();
-                let data = SummaryData {
-                    uptime_seconds: shared.stats.uptime_secs(),
-                    connections_total: shared.stats.get_connects_all(),
-                    connections_bad_total: shared.stats.get_connects_bad(),
-                    connections_bad_by_class,
-                    handshake_failures_by_class,
-                    handshake_timeouts_total: shared.stats.get_handshake_timeouts(),
-                    configured_users: cfg.access.users.len(),
-                };
-                Ok(success_response(StatusCode::OK, data, revision))
-            }
-            ("GET", "/v1/stats/zero/all") => {
-                let revision = current_revision(&shared.config_path).await?;
-                let data = build_zero_all_data(&shared.stats, cfg.access.users.len());
-                Ok(success_response(StatusCode::OK, data, revision))
-            }
-            ("GET", "/v1/stats/upstreams") => {
-                let revision = current_revision(&shared.config_path).await?;
-                let data = build_upstreams_data(shared.as_ref(), api_cfg);
-                Ok(success_response(StatusCode::OK, data, revision))
-            }
-            ("GET", "/v1/stats/minimal/all") => {
-                let revision = current_revision(&shared.config_path).await?;
-                let data = build_minimal_all_data(shared.as_ref(), api_cfg).await;
-                Ok(success_response(StatusCode::OK, data, revision))
-            }
-            ("GET", "/v1/stats/me-writers") => {
-                let revision = current_revision(&shared.config_path).await?;
-                let data = build_me_writers_data(shared.as_ref(), api_cfg).await;
-                Ok(success_response(StatusCode::OK, data, revision))
-            }
-            ("GET", "/v1/stats/dcs") => {
-                let revision = current_revision(&shared.config_path).await?;
-                let data = build_dcs_data(shared.as_ref(), api_cfg).await;
-                Ok(success_response(StatusCode::OK, data, revision))
-            }
-            ("GET", "/v1/runtime/me-pool-state") | ("GET", "/v1/runtime/me_pool_state") => {
-                let revision = current_revision(&shared.config_path).await?;
-                let data = build_runtime_me_pool_state_data(shared.as_ref()).await;
-                Ok(success_response(StatusCode::OK, data, revision))
-            }
-            ("GET", "/v1/runtime/me-quality") | ("GET", "/v1/runtime/me_quality") => {
-                let revision = current_revision(&shared.config_path).await?;
-                let data = build_runtime_me_quality_data(shared.as_ref()).await;
-                Ok(success_response(StatusCode::OK, data, revision))
-            }
-            ("GET", "/v1/runtime/upstream-quality") | ("GET", "/v1/runtime/upstream_quality") => {
-                let revision = current_revision(&shared.config_path).await?;
-                let data = build_runtime_upstream_quality_data(shared.as_ref()).await;
-                Ok(success_response(StatusCode::OK, data, revision))
-            }
-            ("GET", "/v1/runtime/nat-stun") | ("GET", "/v1/runtime/nat_stun") => {
-                let revision = current_revision(&shared.config_path).await?;
-                let data = build_runtime_nat_stun_data(shared.as_ref()).await;
-                Ok(success_response(StatusCode::OK, data, revision))
-            }
-            ("GET", "/v1/runtime/me-selftest") => {
-                let revision = current_revision(&shared.config_path).await?;
-                let data = build_runtime_me_selftest_data(shared.as_ref(), cfg.as_ref()).await;
-                Ok(success_response(StatusCode::OK, data, revision))
-            }
-            ("GET", "/v1/runtime/connections/summary") => {
-                let revision = current_revision(&shared.config_path).await?;
-                let data =
-                    build_runtime_connections_summary_data(shared.as_ref(), cfg.as_ref()).await;
-                Ok(success_response(StatusCode::OK, data, revision))
-            }
-            ("GET", "/v1/runtime/events/recent") => {
-                let revision = current_revision(&shared.config_path).await?;
-                let data = build_runtime_events_recent_data(
-                    shared.as_ref(),
-                    cfg.as_ref(),
-                    query.as_deref(),
-                );
-                Ok(success_response(StatusCode::OK, data, revision))
-            }
-            ("GET", "/v1/runtime/tls-fingerprints") => {
-                let revision = current_revision(&shared.config_path).await?;
-                let data = build_runtime_tls_fingerprints_data(
-                    shared.as_ref(),
-                    cfg.as_ref(),
-                    query.as_deref(),
-                );
-                Ok(success_response(StatusCode::OK, data, revision))
-            }
-            ("GET", "/v1/stats/users/active-ips") => {
-                let revision = current_revision(&shared.config_path).await?;
-                let usernames: Vec<_> = cfg.access.users.keys().cloned().collect();
-                let active_ips_map = shared.ip_tracker.get_active_ips_for_users(&usernames).await;
-                let mut data: Vec<UserActiveIps> = active_ips_map
-                    .into_iter()
-                    .filter(|(_, ips)| !ips.is_empty())
-                    .map(|(username, active_ips)| UserActiveIps {
-                        username,
-                        active_ips,
-                    })
-                    .collect();
-                data.sort_by(|a, b| a.username.cmp(&b.username));
-                Ok(success_response(StatusCode::OK, data, revision))
-            }
-            ("GET", "/v1/stats/users") | ("GET", "/v1/users") => {
-                let revision = current_revision(&shared.config_path).await?;
-                let disk_cfg = load_config_from_disk(&shared.config_path).await?;
-                let runtime_cfg = config_rx.borrow().clone();
-                let (detected_ip_v4, detected_ip_v6) = shared.detected_link_ips();
-                let users = users_from_config(
-                    &disk_cfg,
-                    &shared.stats,
-                    &shared.ip_tracker,
-                    detected_ip_v4,
-                    detected_ip_v6,
-                    Some(runtime_cfg.as_ref()),
-                )
-                .await;
-                Ok(success_response(StatusCode::OK, users, revision))
-            }
-            ("GET", "/v1/stats/users/quota") => {
-                let revision = current_revision(&shared.config_path).await?;
-                let disk_cfg = load_config_from_disk(&shared.config_path).await?;
-                let data = build_user_quota_list(&disk_cfg, shared.stats.as_ref());
-                Ok(success_response(StatusCode::OK, data, revision))
-            }
-            ("POST", "/v1/users") => {
-                if api_cfg.read_only {
-                    return Ok(error_response(
-                        request_id,
-                        ApiFailure::new(
-                            StatusCode::FORBIDDEN,
-                            "read_only",
-                            "API runs in read-only mode",
-                        ),
-                    ));
-                }
-                let expected_revision = parse_if_match(req.headers());
-                let body = read_json::<CreateUserRequest>(req.into_body(), body_limit).await?;
-                let requested_enabled = body.enabled;
-                let result = create_user(body, expected_revision, &shared).await;
-                let (mut data, revision) = match result {
-                    Ok(ok) => ok,
-                    Err(error) => {
-                        shared
-                            .runtime_events
-                            .record("api.user.create.failed", error.code);
-                        return Err(error);
-                    }
-                };
-                let runtime_cfg = config_rx.borrow().clone();
-                data.user.in_runtime = runtime_cfg.access.users.contains_key(&data.user.username);
-                if let Some(enabled) = requested_enabled {
-                    shared
-                        .proxy_shared
-                        .set_user_enabled(&data.user.username, enabled);
-                    if !enabled {
-                        let cancelled = shared
-                            .proxy_shared
-                            .cancel_user_sessions(&data.user.username);
-                        if cancelled > 0 {
-                            shared.runtime_events.record(
-                                "api.user.disable.runtime",
-                                format!(
-                                    "username={} cancelled_sessions={}",
-                                    data.user.username, cancelled
-                                ),
-                            );
-                        }
-                    }
-                }
-                shared.runtime_events.record(
-                    "api.user.create.ok",
-                    format!("username={}", data.user.username),
-                );
-                let status = if data.user.in_runtime {
-                    StatusCode::CREATED
-                } else {
-                    StatusCode::ACCEPTED
-                };
-                Ok(success_response(status, data, revision))
-            }
-            ("GET", "/v1/config") => {
-                let (value, revision) =
-                    config_edit::read_managed_config(&shared.config_path).await?;
-                Ok(success_response(StatusCode::OK, value, revision))
-            }
-            ("POST", "/v1/system/reload") => {
-                if api_cfg.read_only {
-                    return Ok(error_response(
-                        request_id,
-                        ApiFailure::new(
-                            StatusCode::FORBIDDEN,
-                            "read_only",
-                            "API runs in read-only mode",
-                        ),
-                    ));
-                }
-                let expected_revision = parse_if_match(req.headers());
-                let request = read_optional_json::<ReloadRequest>(req.into_body(), body_limit)
-                    .await?
-                    .unwrap_or_default();
-                request.validate().map_err(ApiFailure::bad_request)?;
-
-                let (accepted, revision) = submit_reload_from_disk(
-                    &shared.config_path,
-                    shared.mutation_lock.as_ref(),
-                    &shared.reload_control,
-                    expected_revision.as_deref(),
-                    request,
-                )
-                .await?;
-                Ok(success_response(StatusCode::ACCEPTED, accepted, revision))
-            }
-            ("PATCH", "/v1/config") => {
-                if api_cfg.read_only {
-                    return Ok(error_response(
-                        request_id,
-                        ApiFailure::new(
-                            StatusCode::FORBIDDEN,
-                            "read_only",
-                            "API runs in read-only mode",
-                        ),
-                    ));
-                }
-                let expected_revision = parse_if_match(req.headers());
-                let reload_request =
-                    ReloadRequest::from_query(query.as_deref()).map_err(ApiFailure::bad_request)?;
-                let body = read_json::<serde_json::Value>(req.into_body(), body_limit).await?;
-                match config_edit::patch_config(body, expected_revision, reload_request, &shared)
-                    .await
-                {
-                    Ok(resp) => {
-                        let revision = resp.revision.clone();
-                        let status = if resp.reload.is_some() {
-                            StatusCode::ACCEPTED
-                        } else {
-                            StatusCode::OK
-                        };
-                        Ok(success_response(status, resp, revision))
-                    }
-                    Err(error) => {
-                        shared
-                            .runtime_events
-                            .record("api.config.patch.failed", error.code);
-                        Err(error)
-                    }
-                }
-            }
-            _ => {
-                if method == Method::GET
-                    && let Some(reload_id) = reload_status_route_id(normalized_path)
-                {
-                    let revision = current_revision(&shared.config_path).await?;
-                    let status =
-                        shared
-                            .reload_control
-                            .status(reload_id)
-                            .await
-                            .ok_or_else(|| {
-                                ApiFailure::new(
-                                    StatusCode::NOT_FOUND,
-                                    "reload_not_found",
-                                    format!("Reload {} was not found", reload_id),
-                                )
-                            })?;
-                    return Ok(success_response(StatusCode::OK, status, revision));
-                }
-                if method == Method::POST
-                    && let Some(base_user) = normalized_path
-                        .strip_prefix("/v1/users/")
-                        .and_then(|path| path.strip_suffix("/enable"))
-                    && !base_user.is_empty()
-                    && !base_user.contains('/')
-                {
-                    let base_user = parse_route_username(base_user)?;
-                    if api_cfg.read_only {
-                        return Ok(error_response(
-                            request_id,
-                            ApiFailure::new(
-                                StatusCode::FORBIDDEN,
-                                "read_only",
-                                "API runs in read-only mode",
-                            ),
-                        ));
-                    }
-                    let expected_revision = parse_if_match(req.headers());
-                    let result =
-                        set_user_enabled(base_user, true, expected_revision, &shared).await;
-                    let (mut data, revision) = match result {
-                        Ok(ok) => ok,
-                        Err(error) => {
-                            shared.runtime_events.record(
-                                "api.user.enable.failed",
-                                format!("username={} code={}", base_user, error.code),
-                            );
-                            return Err(error);
-                        }
-                    };
-                    let runtime_cfg = config_rx.borrow().clone();
-                    data.in_runtime = runtime_cfg.access.users.contains_key(&data.username);
-                    shared.proxy_shared.set_user_enabled(base_user, true);
-                    shared
-                        .runtime_events
-                        .record("api.user.enable.ok", format!("username={}", base_user));
-                    let status = if data.in_runtime {
-                        StatusCode::OK
-                    } else {
-                        StatusCode::ACCEPTED
-                    };
-                    return Ok(success_response(status, data, revision));
-                }
-                if method == Method::POST
-                    && let Some(base_user) = normalized_path
-                        .strip_prefix("/v1/users/")
-                        .and_then(|path| path.strip_suffix("/disable"))
-                    && !base_user.is_empty()
-                    && !base_user.contains('/')
-                {
-                    let base_user = parse_route_username(base_user)?;
-                    if api_cfg.read_only {
-                        return Ok(error_response(
-                            request_id,
-                            ApiFailure::new(
-                                StatusCode::FORBIDDEN,
-                                "read_only",
-                                "API runs in read-only mode",
-                            ),
-                        ));
-                    }
-                    let expected_revision = parse_if_match(req.headers());
-                    let result =
-                        set_user_enabled(base_user, false, expected_revision, &shared).await;
-                    let (mut data, revision) = match result {
-                        Ok(ok) => ok,
-                        Err(error) => {
-                            shared.runtime_events.record(
-                                "api.user.disable.failed",
-                                format!("username={} code={}", base_user, error.code),
-                            );
-                            return Err(error);
-                        }
-                    };
-                    let runtime_cfg = config_rx.borrow().clone();
-                    data.in_runtime = runtime_cfg.access.users.contains_key(&data.username);
-                    let newly_disabled = shared.proxy_shared.set_user_enabled(base_user, false);
-                    let cancelled = shared.proxy_shared.cancel_user_sessions(base_user);
-                    shared.runtime_events.record(
-                        "api.user.disable.ok",
-                        format!(
-                            "username={} newly_disabled={} cancelled_sessions={}",
-                            base_user, newly_disabled, cancelled
-                        ),
-                    );
-                    let status = if data.in_runtime {
-                        StatusCode::OK
-                    } else {
-                        StatusCode::ACCEPTED
-                    };
-                    return Ok(success_response(status, data, revision));
-                }
-                if method == Method::POST
-                    && let Some(user) = normalized_path
-                        .strip_prefix("/v1/users/")
-                        .and_then(|path| path.strip_suffix("/reset-quota"))
-                    && !user.is_empty()
-                    && !user.contains('/')
-                {
-                    let user = parse_route_username(user)?;
-                    if api_cfg.read_only {
-                        return Ok(error_response(
-                            request_id,
-                            ApiFailure::new(
-                                StatusCode::FORBIDDEN,
-                                "read_only",
-                                "API runs in read-only mode",
-                            ),
-                        ));
-                    }
-                    let expected_revision = parse_if_match(req.headers());
-                    let disk_cfg = load_config_from_disk(&shared.config_path).await?;
-                    ensure_expected_revision(&shared.config_path, expected_revision.as_deref())
-                        .await?;
-                    if !disk_cfg.access.users.contains_key(user) {
-                        return Ok(error_response(
-                            request_id,
-                            ApiFailure::new(StatusCode::NOT_FOUND, "not_found", "User not found"),
-                        ));
-                    }
-                    let snapshot = match crate::quota_state::reset_user_quota(
-                        &shared.quota_state_path,
-                        shared.stats.as_ref(),
-                        user,
-                    )
-                    .await
-                    {
-                        Ok(snapshot) => snapshot,
-                        Err(error) => {
-                            shared.runtime_events.record(
-                                "api.user.reset_quota.failed",
-                                format!("username={} error={}", user, error),
-                            );
-                            return Err(ApiFailure::internal(format!(
-                                "Failed to reset user quota: {}",
-                                error
-                            )));
-                        }
-                    };
-                    shared
-                        .runtime_events
-                        .record("api.user.reset_quota.ok", format!("username={}", user));
-                    let revision = current_revision(&shared.config_path).await?;
-                    return Ok(success_response(
-                        StatusCode::OK,
-                        ResetUserQuotaResponse {
-                            username: user.to_string(),
-                            used_bytes: snapshot.used_bytes,
-                            last_reset_epoch_secs: snapshot.last_reset_epoch_secs,
-                        },
-                        revision,
-                    ));
-                }
-                if method == Method::POST
-                    && let Some(base_user) = normalized_path
-                        .strip_prefix("/v1/users/")
-                        .and_then(|path| path.strip_suffix("/rotate-secret"))
-                    && !base_user.is_empty()
-                    && !base_user.contains('/')
-                {
-                    let base_user = parse_route_username(base_user)?;
-                    if api_cfg.read_only {
-                        return Ok(error_response(
-                            request_id,
-                            ApiFailure::new(
-                                StatusCode::FORBIDDEN,
-                                "read_only",
-                                "API runs in read-only mode",
-                            ),
-                        ));
-                    }
-                    let expected_revision = parse_if_match(req.headers());
-                    let body =
-                        read_optional_json::<RotateSecretRequest>(req.into_body(), body_limit)
-                            .await?;
-                    let result = rotate_secret(
-                        base_user,
-                        body.unwrap_or_default(),
-                        expected_revision,
-                        &shared,
-                    )
-                    .await;
-                    let (mut data, revision) = match result {
-                        Ok(ok) => ok,
-                        Err(error) => {
-                            shared.runtime_events.record(
-                                "api.user.rotate_secret.failed",
-                                format!("username={} code={}", base_user, error.code),
-                            );
-                            return Err(error);
-                        }
-                    };
-                    let runtime_cfg = config_rx.borrow().clone();
-                    data.user.in_runtime =
-                        runtime_cfg.access.users.contains_key(&data.user.username);
-                    shared.runtime_events.record(
-                        "api.user.rotate_secret.ok",
-                        format!("username={}", base_user),
-                    );
-                    let status = if data.user.in_runtime {
-                        StatusCode::OK
-                    } else {
-                        StatusCode::ACCEPTED
-                    };
-                    return Ok(success_response(status, data, revision));
-                }
-                if let Some(user) = normalized_path.strip_prefix("/v1/users/")
-                    && !user.is_empty()
-                    && !user.contains('/')
-                {
-                    let user = parse_route_username(user)?;
-                    if method == Method::GET {
-                        let revision = current_revision(&shared.config_path).await?;
-                        let disk_cfg = load_config_from_disk(&shared.config_path).await?;
-                        let runtime_cfg = config_rx.borrow().clone();
-                        let (detected_ip_v4, detected_ip_v6) = shared.detected_link_ips();
-                        let users = users_from_config(
-                            &disk_cfg,
-                            &shared.stats,
-                            &shared.ip_tracker,
-                            detected_ip_v4,
-                            detected_ip_v6,
-                            Some(runtime_cfg.as_ref()),
-                        )
-                        .await;
-                        if let Some(user_info) =
-                            users.into_iter().find(|entry| entry.username == user)
-                        {
-                            return Ok(success_response(StatusCode::OK, user_info, revision));
-                        }
-                        return Ok(error_response(
-                            request_id,
-                            ApiFailure::new(StatusCode::NOT_FOUND, "not_found", "User not found"),
-                        ));
-                    }
-                    if method == Method::PATCH {
-                        if api_cfg.read_only {
-                            return Ok(error_response(
-                                request_id,
-                                ApiFailure::new(
-                                    StatusCode::FORBIDDEN,
-                                    "read_only",
-                                    "API runs in read-only mode",
-                                ),
-                            ));
-                        }
-                        let expected_revision = parse_if_match(req.headers());
-                        let body =
-                            read_json::<PatchUserRequest>(req.into_body(), body_limit).await?;
-                        let enabled_update = match &body.enabled {
-                            Patch::Unchanged => None,
-                            Patch::Remove => Some(true),
-                            Patch::Set(enabled) => Some(*enabled),
-                        };
-                        let result = patch_user(user, body, expected_revision, &shared).await;
-                        let (mut data, revision) = match result {
-                            Ok(ok) => ok,
-                            Err(error) => {
-                                shared.runtime_events.record(
-                                    "api.user.patch.failed",
-                                    format!("username={} code={}", user, error.code),
-                                );
-                                return Err(error);
-                            }
-                        };
-                        let runtime_cfg = config_rx.borrow().clone();
-                        data.in_runtime = runtime_cfg.access.users.contains_key(&data.username);
-                        if let Some(enabled) = enabled_update {
-                            shared
-                                .proxy_shared
-                                .set_user_enabled(&data.username, enabled);
-                            if !enabled {
-                                let cancelled =
-                                    shared.proxy_shared.cancel_user_sessions(&data.username);
-                                shared.runtime_events.record(
-                                    "api.user.disable.runtime",
-                                    format!(
-                                        "username={} cancelled_sessions={}",
-                                        data.username, cancelled
-                                    ),
-                                );
-                            }
-                        }
-                        shared
-                            .runtime_events
-                            .record("api.user.patch.ok", format!("username={}", data.username));
-                        let status = if data.in_runtime {
-                            StatusCode::OK
-                        } else {
-                            StatusCode::ACCEPTED
-                        };
-                        return Ok(success_response(status, data, revision));
-                    }
-                    if method == Method::DELETE {
-                        if api_cfg.read_only {
-                            return Ok(error_response(
-                                request_id,
-                                ApiFailure::new(
-                                    StatusCode::FORBIDDEN,
-                                    "read_only",
-                                    "API runs in read-only mode",
-                                ),
-                            ));
-                        }
-                        let expected_revision = parse_if_match(req.headers());
-                        let result = delete_user(user, expected_revision, &shared).await;
-                        let (deleted_user, revision) = match result {
-                            Ok(ok) => ok,
-                            Err(error) => {
-                                shared.runtime_events.record(
-                                    "api.user.delete.failed",
-                                    format!("username={} code={}", user, error.code),
-                                );
-                                return Err(error);
-                            }
-                        };
-                        shared.proxy_shared.set_user_enabled(&deleted_user, true);
-                        let cancelled = shared.proxy_shared.cancel_user_sessions(&deleted_user);
-                        shared.runtime_events.record(
-                            "api.user.delete.ok",
-                            format!("username={} cancelled_sessions={}", deleted_user, cancelled),
-                        );
-                        let runtime_cfg = config_rx.borrow().clone();
-                        let in_runtime = runtime_cfg.access.users.contains_key(&deleted_user);
-                        let response = DeleteUserResponse {
-                            username: deleted_user,
-                            in_runtime,
-                        };
-                        let status = if response.in_runtime {
-                            StatusCode::ACCEPTED
-                        } else {
-                            StatusCode::OK
-                        };
-                        return Ok(success_response(status, response, revision));
-                    }
-                    if method == Method::POST {
-                        return Ok(error_response(
-                            request_id,
-                            ApiFailure::method_not_allowed(ALLOW_GET_PATCH_DELETE),
-                        ));
-                    }
-                    return Ok(error_response(
-                        request_id,
-                        ApiFailure::method_not_allowed(ALLOW_GET_PATCH_DELETE),
-                    ));
-                }
-                if let Some(allow) = allowed_methods_for_path(normalized_path) {
-                    return Ok(error_response(
-                        request_id,
-                        ApiFailure::method_not_allowed(allow),
-                    ));
-                }
-                debug!(
-                    method = method.as_str(),
-                    path = %path,
-                    normalized_path = %normalized_path,
-                    "API route not found"
-                );
-                Ok(error_response(
-                    request_id,
-                    ApiFailure::new(StatusCode::NOT_FOUND, "not_found", "Route not found"),
-                ))
-            }
-        }
-    }
-    .await;
-
-    match result {
-        Ok(resp) => Ok(resp),
-        Err(error) => Ok(error_response(request_id, error)),
     }
 }

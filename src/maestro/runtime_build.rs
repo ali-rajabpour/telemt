@@ -5,31 +5,43 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{RwLock, Semaphore, watch};
 
-use crate::config::ProxyConfig;
+use crate::config::{
+    ProxyConfig, ServerConfig, WEB_CARRIER_LEARNING_MIN_ENTRIES, web_debug_fits_limits,
+};
 use crate::crypto::SecureRandom;
 use crate::ip_tracker::UserIpTracker;
 use crate::network::probe::{decide_network_capabilities, run_probe};
-use crate::proxy::direct_buffer_budget::{
-    DirectBufferBudget, resolve_direct_buffer_hard_limit, run_direct_buffer_budget_controller,
-};
+use crate::proxy::direct_buffer_budget::{DirectBufferBudget, run_direct_buffer_budget_controller};
 use crate::proxy::route_mode::{RelayRouteMode, RouteRuntimeController};
 use crate::proxy::shared_state::ProxySharedState;
+use crate::proxy::traffic_limiter::TrafficLimiter;
+use crate::proxy::user_admission::UserAdmissionAuthority;
+use crate::proxy::user_connection_authority::UserConnectionAuthority;
 use crate::startup::StartupTracker;
 use crate::stats::beobachten::BeobachtenStore;
 use crate::stats::telemetry::TelemetryPolicy;
 use crate::stats::{QuotaStore, ReplayChecker, Stats};
 use crate::stream::BufferPool;
+use crate::tls_front::cache::TlsFullCertBudget;
 use crate::transport::UpstreamManager;
 use crate::transport::middle_proxy::MePool;
 
 use super::admission;
-use super::generation::{RuntimeGeneration, RuntimeTaskScope};
+use super::generation::{RuntimeGeneration, RuntimeTaskScope, RuntimeTaskScopePreparationGuard};
+use super::listeners::listener_rebind_supported;
 use super::runtime_tasks::RuntimeLogFilter;
 use super::{me_startup, runtime_tasks, tls_bootstrap};
 
+/// Fully prepared candidate runtime and its activation-gated config watcher.
 pub(crate) struct PreparedRuntime {
+    /// Candidate generation ready for publication.
     pub(crate) generation: Arc<RuntimeGeneration>,
+    /// Detected public addresses associated with the candidate.
     pub(crate) detected_ips: (Option<IpAddr>, Option<IpAddr>),
+    /// Gate opened only after the candidate becomes the active generation.
+    pub(crate) config_watcher_activation: watch::Sender<bool>,
+    /// User-authority epoch captured before candidate construction.
+    pub(crate) user_admission_epoch: u64,
 }
 
 pub(crate) async fn prepare_runtime(
@@ -37,15 +49,30 @@ pub(crate) async fn prepare_runtime(
     config: ProxyConfig,
     config_path: &Path,
     quota_store: Arc<QuotaStore>,
+    connection_authority: Arc<UserConnectionAuthority>,
     runtime_log_filter: RuntimeLogFilter,
+    tls_full_cert_budget: Arc<TlsFullCertBudget>,
+    user_admission: Arc<UserAdmissionAuthority>,
+    ip_tracker: Arc<UserIpTracker>,
+    traffic_limiter: Arc<TrafficLimiter>,
+    direct_buffer_budget: Arc<DirectBufferBudget>,
+    max_connections: Arc<Semaphore>,
 ) -> Result<PreparedRuntime, String> {
+    let user_admission_epoch = user_admission.epoch();
+    config
+        .validate_web_decoy_listener_separation()
+        .map_err(|error| error.to_string())?;
     let started_at_epoch_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
     let startup_tracker = Arc::new(StartupTracker::new(started_at_epoch_secs));
     let task_scope = RuntimeTaskScope::new();
-    let stats = Arc::new(Stats::with_quota_store(quota_store));
+    let task_scope_guard = RuntimeTaskScopePreparationGuard::new(task_scope.clone());
+    let stats = Arc::new(Stats::with_process_authorities(
+        quota_store,
+        connection_authority,
+    ));
     stats.apply_telemetry_policy(TelemetryPolicy::from_config(&config.general.telemetry));
 
     let upstream_manager = Arc::new(
@@ -62,29 +89,10 @@ pub(crate) async fn prepare_runtime(
         .with_dns_overrides(&config.network.dns_overrides)
         .map_err(|error| format!("DNS override preparation failed: {}", error))?,
     );
-    let ip_tracker = Arc::new(UserIpTracker::new());
-    ip_tracker
-        .load_limits(
-            config.access.user_max_unique_ips_global_each,
-            &config.access.user_max_unique_ips,
-        )
-        .await;
-    ip_tracker
-        .set_limit_policy(
-            config.access.user_max_unique_ips_mode,
-            config.access.user_max_unique_ips_window_secs,
-        )
-        .await;
-
-    let hard_limit =
-        resolve_direct_buffer_hard_limit(config.general.direct_relay_buffer_budget_max_bytes).await;
-    let direct_buffer_budget = DirectBufferBudget::new(hard_limit);
-    let proxy_shared =
-        ProxySharedState::new_with_direct_buffer_budget(direct_buffer_budget.clone());
-    proxy_shared.apply_user_enabled_config(&config.access.user_enabled);
-    proxy_shared.traffic_limiter.apply_policy(
-        config.access.user_rate_limits.clone(),
-        config.access.cidr_rate_limits.clone(),
+    let proxy_shared = ProxySharedState::new_with_process_authorities(
+        direct_buffer_budget.clone(),
+        traffic_limiter,
+        user_admission,
     );
 
     let probe = run_probe(
@@ -112,6 +120,7 @@ pub(crate) async fn prepare_runtime(
         upstream_manager.clone(),
         &startup_tracker,
         task_scope.clone(),
+        tls_full_cert_budget,
         tls_bootstrap::TlsBootstrapPolicy::RequireReady,
     )
     .await
@@ -164,13 +173,9 @@ pub(crate) async fn prepare_runtime(
         Duration::from_secs(config.access.replay_window_secs),
     ));
     let buffer_pool = Arc::new(BufferPool::with_config(64 * 1024, 4096));
-    let max_connections_limit = if config.server.max_connections == 0 {
-        Semaphore::MAX_PERMITS
-    } else {
-        config.server.max_connections as usize
-    };
-    let max_connections = Arc::new(Semaphore::new(max_connections_limit));
+    let (config_watcher_activation, config_watcher_activation_rx) = watch::channel(false);
     let watches = runtime_tasks::spawn_runtime_tasks(
+        generation_id,
         &config,
         config_path,
         &probe,
@@ -189,6 +194,7 @@ pub(crate) async fn prepare_runtime(
         proxy_shared.clone(),
         me_ready_tx.clone(),
         task_scope.clone(),
+        Some(config_watcher_activation_rx),
     )
     .await;
     let config_rx = watches.config_rx;
@@ -265,10 +271,12 @@ pub(crate) async fn prepare_runtime(
         conntrack_scope.cancellation_token(),
     ));
     task_scope.spawn(run_direct_buffer_budget_controller(
+        generation_id,
         direct_buffer_budget,
         buffer_pool.clone(),
         stats.clone(),
         proxy_shared.clone(),
+        max_connections.clone(),
         config.server.max_connections,
     ));
     let generation = RuntimeGeneration::new(
@@ -290,10 +298,13 @@ pub(crate) async fn prepare_runtime(
         max_connections,
         task_scope,
     );
+    task_scope_guard.disarm();
     drop(admission_tx);
 
     Ok(PreparedRuntime {
         generation,
+        config_watcher_activation,
+        user_admission_epoch,
         detected_ips: (
             probe.detected_ipv4.map(IpAddr::V4),
             probe.detected_ipv6.map(IpAddr::V6),
@@ -309,75 +320,201 @@ fn strict_middle_proxy_unavailable(
     use_middle_proxy && !direct_first_startup && !pool_available
 }
 
-pub(crate) fn deferred_process_fields(old: &ProxyConfig, new: &ProxyConfig) -> Vec<String> {
+pub(crate) struct ResolvedReloadConfig {
+    /// Runtime-safe candidate with process-owned values retained from active state.
+    pub(crate) effective: ProxyConfig,
+    /// Stable public labels for desired fields deferred until process restart.
+    pub(crate) deferred_process_fields: Vec<String>,
+    /// Whether activating the effective candidate changes runtime-owned state.
+    pub(crate) runtime_changed: bool,
+}
+
+/// Resolves desired configuration into effective runtime and deferred process state.
+pub(crate) fn resolve_reload_config(
+    old: &ProxyConfig,
+    desired: &ProxyConfig,
+) -> Result<ResolvedReloadConfig, String> {
+    let mut effective = desired.clone();
     let mut fields = Vec::new();
-    if old.server.port != new.server.port
-        || old.server.proxy_protocol != new.server.proxy_protocol
-        || old.server.listen_backlog != new.server.listen_backlog
-        || serde_json::to_value(&old.server.listeners).ok()
-            != serde_json::to_value(&new.server.listeners).ok()
-    {
+    let listener_identity_matches = listeners_have_same_bind_identity(&old.server, &desired.server);
+    let global_listener_policy_changed = old.server.port != desired.server.port
+        || old.server.listen_addr_ipv4 != desired.server.listen_addr_ipv4
+        || old.server.listen_addr_ipv6 != desired.server.listen_addr_ipv6
+        || old.server.listen_tcp != desired.server.listen_tcp
+        || old.server.client_mss != desired.server.client_mss
+        || old.server.client_mss_bulk != desired.server.client_mss_bulk
+        || old.server.proxy_protocol != desired.server.proxy_protocol
+        || old.server.listen_backlog != desired.server.listen_backlog;
+    let listener_policy_changed =
+        listener_identity_matches && !listener_process_fields_equal(&old.server, &desired.server);
+    let unsupported_identity_change =
+        !listener_identity_matches && !listener_rebind_supported(old, desired);
+    if global_listener_policy_changed || listener_policy_changed || unsupported_identity_change {
         fields.push("server.listeners".to_string());
+        effective.server.port = old.server.port;
+        effective.server.listen_addr_ipv4 = old.server.listen_addr_ipv4.clone();
+        effective.server.listen_addr_ipv6 = old.server.listen_addr_ipv6.clone();
+        effective.server.listen_tcp = old.server.listen_tcp;
+        effective.server.client_mss = old.server.client_mss.clone();
+        effective.server.client_mss_bulk = old.server.client_mss_bulk.clone();
+        effective.server.proxy_protocol = old.server.proxy_protocol;
+        effective.server.listen_backlog = old.server.listen_backlog;
+        effective.server.listeners = old.server.listeners.clone();
+        if listener_identity_matches {
+            for (effective_listener, desired_listener) in effective
+                .server
+                .listeners
+                .iter_mut()
+                .zip(&desired.server.listeners)
+            {
+                effective_listener.announce = desired_listener.announce.clone();
+                effective_listener.announce_ip = desired_listener.announce_ip;
+            }
+        }
     }
-    if old.server.listen_unix_sock != new.server.listen_unix_sock
-        || old.server.listen_unix_sock_perm != new.server.listen_unix_sock_perm
+    if old.server.listen_unix_sock != desired.server.listen_unix_sock
+        || old.server.listen_unix_sock_perm != desired.server.listen_unix_sock_perm
     {
         fields.push("server.listen_unix_sock".to_string());
+        effective.server.listen_unix_sock = old.server.listen_unix_sock.clone();
+        effective.server.listen_unix_sock_perm = old.server.listen_unix_sock_perm.clone();
     }
-    if old.server.api.listen != new.server.api.listen
-        || old.server.api.enabled != new.server.api.enabled
+    if old.server.api.listen != desired.server.api.listen
+        || old.server.api.enabled != desired.server.api.enabled
     {
         fields.push("server.api.listen".to_string());
+        effective.server.api.listen = old.server.api.listen.clone();
+        effective.server.api.enabled = old.server.api.enabled;
     }
-    if old.server.metrics_listen != new.server.metrics_listen
-        || old.server.metrics_port != new.server.metrics_port
+    if old.server.api.runtime_edge_events_capacity
+        != desired.server.api.runtime_edge_events_capacity
+    {
+        fields.push("server.api.runtime_edge_events_capacity".to_string());
+        effective.server.api.runtime_edge_events_capacity =
+            old.server.api.runtime_edge_events_capacity;
+    }
+    if old.server.metrics_listen != desired.server.metrics_listen
+        || old.server.metrics_port != desired.server.metrics_port
     {
         fields.push("server.metrics_listen".to_string());
+        effective.server.metrics_listen = old.server.metrics_listen.clone();
+        effective.server.metrics_port = old.server.metrics_port;
     }
-    if old.general.quota_state_path != new.general.quota_state_path {
+    if old.server.max_connections != desired.server.max_connections {
+        fields.push("server.max_connections".to_string());
+        effective.server.max_connections = old.server.max_connections;
+    }
+    if serde_json::to_value(&old.server.conntrack_control).ok()
+        != serde_json::to_value(&desired.server.conntrack_control).ok()
+    {
+        fields.push("server.conntrack_control".to_string());
+        effective.server.conntrack_control = old.server.conntrack_control.clone();
+    }
+    if old.general.direct_relay_buffer_budget_max_bytes
+        != desired.general.direct_relay_buffer_budget_max_bytes
+    {
+        fields.push("general.direct_relay_buffer_budget_max_bytes".to_string());
+        effective.general.direct_relay_buffer_budget_max_bytes =
+            old.general.direct_relay_buffer_budget_max_bytes;
+    }
+    if old.general.quota_state_path != desired.general.quota_state_path {
         fields.push("general.quota_state_path".to_string());
+        effective.general.quota_state_path = old.general.quota_state_path.clone();
     }
-    if old.general.disable_colors != new.general.disable_colors {
+    if old.general.disable_colors != desired.general.disable_colors {
         fields.push("general.disable_colors".to_string());
+        effective.general.disable_colors = old.general.disable_colors;
     }
-    if old.general.data_path != new.general.data_path {
+    if old.general.data_path != desired.general.data_path {
         fields.push("general.data_path".to_string());
+        effective.general.data_path = old.general.data_path.clone();
     }
-    if serde_json::to_value(&old.logging).ok() != serde_json::to_value(&new.logging).ok() {
+    if serde_json::to_value(&old.logging).ok() != serde_json::to_value(&desired.logging).ok() {
         fields.push("logging".to_string());
+        effective.logging = old.logging.clone();
     }
-    fields
+    if serde_json::to_value(&old.web.limits).ok() != serde_json::to_value(&desired.web.limits).ok()
+    {
+        fields.push("web.limits".to_string());
+        effective.web.limits = old.web.limits.clone();
+    }
+    if old.web.decoy_fasttrack_mode != desired.web.decoy_fasttrack_mode {
+        fields.push("web.decoy_fasttrack_mode".to_string());
+        effective.web.decoy_fasttrack_mode = old.web.decoy_fasttrack_mode;
+    }
+    if effective.web.carrier_negotiation_enabled()
+        && effective.web.carrier_learning
+        && effective.web.limits.max_carrier_learning_entries < WEB_CARRIER_LEARNING_MIN_ENTRIES
+    {
+        if old.web.carrier_learning != desired.web.carrier_learning {
+            fields.push("web.carrier_learning".to_string());
+            effective.web.carrier_learning = old.web.carrier_learning;
+        } else {
+            fields.push("web.carriers".to_string());
+            effective.web.carriers = old.web.carriers.clone();
+        }
+    }
+    if !web_debug_fits_limits(&effective.web.debug, &effective.web.limits) {
+        fields.push("web.debug".to_string());
+        effective.web.debug = old.web.debug.clone();
+    }
+    effective
+        .validate_effective_web()
+        .map_err(|error| format!("effective WEB configuration is invalid: {error}"))?;
+    effective
+        .rebuild_runtime_user_auth()
+        .map_err(|error| format!("effective user runtime preparation failed: {error}"))?;
+    effective
+        .rebuild_runtime_web()
+        .map_err(|error| format!("effective WEB runtime preparation failed: {error}"))?;
+    let runtime_changed = !configs_equal(old, &effective);
+    Ok(ResolvedReloadConfig {
+        effective,
+        deferred_process_fields: fields,
+        runtime_changed,
+    })
+}
+
+fn listeners_have_same_bind_identity(old: &ServerConfig, desired: &ServerConfig) -> bool {
+    old.listeners.len() == desired.listeners.len()
+        && old
+            .listeners
+            .iter()
+            .zip(&desired.listeners)
+            .all(|(old_listener, desired_listener)| {
+                old_listener.ip == desired_listener.ip
+                    && old_listener.port.unwrap_or(old.port)
+                        == desired_listener.port.unwrap_or(desired.port)
+            })
+}
+
+fn listener_process_fields_equal(old: &ServerConfig, desired: &ServerConfig) -> bool {
+    let mut old_listeners = old.listeners.clone();
+    let mut desired_listeners = desired.listeners.clone();
+    for listener in &mut old_listeners {
+        listener.announce = None;
+        listener.announce_ip = None;
+    }
+    for listener in &mut desired_listeners {
+        listener.announce = None;
+        listener.announce_ip = None;
+    }
+    serde_json::to_value(old_listeners).ok() == serde_json::to_value(desired_listeners).ok()
+}
+
+/// Returns process-owned fields that cannot change in the current generation.
+pub(crate) fn deferred_process_fields(
+    old: &ProxyConfig,
+    new: &ProxyConfig,
+) -> Result<Vec<String>, String> {
+    resolve_reload_config(old, new).map(|resolved| resolved.deferred_process_fields)
+}
+
+fn configs_equal(old: &ProxyConfig, new: &ProxyConfig) -> bool {
+    serde_json::to_value(old).ok() == serde_json::to_value(new).ok()
+        && old.web_decoy_endpoints_equal(new)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn process_socket_and_logging_changes_are_deferred() {
-        let old = ProxyConfig::default();
-        let mut new = old.clone();
-        new.server.listen_backlog = new.server.listen_backlog.saturating_add(1);
-        new.general.disable_colors = !new.general.disable_colors;
-
-        let fields = deferred_process_fields(&old, &new);
-        assert!(fields.contains(&"server.listeners".to_string()));
-        assert!(fields.contains(&"general.disable_colors".to_string()));
-    }
-
-    #[test]
-    fn runtime_only_change_does_not_require_process_rebind() {
-        let old = ProxyConfig::default();
-        let mut new = old.clone();
-        new.censorship.tls_domain = "reload.example".to_string();
-        assert!(deferred_process_fields(&old, &new).is_empty());
-    }
-
-    #[test]
-    fn strict_middle_proxy_requires_a_prepared_pool() {
-        assert!(strict_middle_proxy_unavailable(true, false, false));
-        assert!(!strict_middle_proxy_unavailable(true, false, true));
-        assert!(!strict_middle_proxy_unavailable(true, true, false));
-        assert!(!strict_middle_proxy_unavailable(false, false, false));
-    }
-}
+#[path = "runtime_build_tests.rs"]
+mod tests;

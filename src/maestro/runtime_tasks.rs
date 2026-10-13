@@ -26,6 +26,7 @@ use crate::stats::{ReplayChecker, Stats};
 use crate::transport::UpstreamManager;
 use crate::transport::middle_proxy::{MePool, MeReinitTrigger};
 
+use super::control_plane::ProcessControlPlane;
 use super::generation::RuntimeGeneration;
 use super::generation::RuntimeTaskScope;
 use super::helpers::write_beobachten_snapshot;
@@ -89,6 +90,7 @@ impl RuntimeLogFilter {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn spawn_runtime_tasks(
+    generation_id: u64,
     config: &Arc<ProxyConfig>,
     config_path: &Path,
     probe: &NetworkProbe,
@@ -107,6 +109,7 @@ pub(crate) async fn spawn_runtime_tasks(
     shared_state: Arc<ProxySharedState>,
     me_ready_tx: watch::Sender<u64>,
     task_scope: RuntimeTaskScope,
+    config_watcher_activation: Option<watch::Receiver<bool>>,
 ) -> RuntimeWatches {
     let um_clone = upstream_manager.clone();
     let dc_overrides_for_health = config.dc_overrides.clone();
@@ -135,7 +138,9 @@ pub(crate) async fn spawn_runtime_tasks(
 
     let ip_tracker_maintenance = ip_tracker.clone();
     task_scope.spawn(async move {
-        ip_tracker_maintenance.run_periodic_maintenance().await;
+        ip_tracker_maintenance
+            .run_periodic_maintenance(generation_id)
+            .await;
     });
 
     let detected_ip_v4: Option<IpAddr> = probe.detected_ipv4.map(IpAddr::V4);
@@ -151,14 +156,16 @@ pub(crate) async fn spawn_runtime_tasks(
             Some("spawn config hot-reload watcher".to_string()),
         )
         .await;
-    let (config_rx, log_level_rx): (watch::Receiver<Arc<ProxyConfig>>, watch::Receiver<LogLevel>) =
-        spawn_config_watcher(
-            config_path.to_path_buf(),
-            config.clone(),
-            detected_ip_v4,
-            detected_ip_v6,
-            task_scope.cancellation_token(),
-        );
+    let (config_rx, log_level_rx, config_watcher_task) = spawn_config_watcher(
+        config_path.to_path_buf(),
+        config.clone(),
+        detected_ip_v4,
+        detected_ip_v6,
+        task_scope.cancellation_token(),
+        Some(upstream_manager.dns_resolver()),
+        config_watcher_activation,
+    );
+    task_scope.spawn(config_watcher_task);
     startup_tracker
         .complete_component(
             COMPONENT_CONFIG_WATCHER_START,
@@ -166,7 +173,6 @@ pub(crate) async fn spawn_runtime_tasks(
         )
         .await;
     let stats_policy = stats.clone();
-    let upstream_policy = upstream_manager.clone();
     let mut config_rx_policy = config_rx.clone();
     task_scope.spawn(async move {
         loop {
@@ -176,9 +182,6 @@ pub(crate) async fn spawn_runtime_tasks(
             let cfg = config_rx_policy.borrow_and_update().clone();
             stats_policy
                 .apply_telemetry_policy(TelemetryPolicy::from_config(&cfg.general.telemetry));
-            if let Err(error) = upstream_policy.update_dns_overrides(&cfg.network.dns_overrides) {
-                warn!(error = %error, "Failed to update generation DNS overrides");
-            }
             if let Some(pool) = &me_pool_for_policy {
                 pool.update_runtime_transport_policy(
                     cfg.general.me_socks_kdf_policy,
@@ -196,20 +199,7 @@ pub(crate) async fn spawn_runtime_tasks(
     let ip_tracker_policy = ip_tracker.clone();
     let mut config_rx_ip_limits = config_rx.clone();
     task_scope.spawn(async move {
-        let mut prev_limits = config_rx_ip_limits
-            .borrow()
-            .access
-            .user_max_unique_ips
-            .clone();
-        let mut prev_global_each = config_rx_ip_limits
-            .borrow()
-            .access
-            .user_max_unique_ips_global_each;
-        let mut prev_mode = config_rx_ip_limits.borrow().access.user_max_unique_ips_mode;
-        let mut prev_window = config_rx_ip_limits
-            .borrow()
-            .access
-            .user_max_unique_ips_window_secs;
+        let mut previous = config_rx_ip_limits.borrow().access.clone();
 
         loop {
             if config_rx_ip_limits.changed().await.is_err() {
@@ -217,39 +207,28 @@ pub(crate) async fn spawn_runtime_tasks(
             }
             let cfg = config_rx_ip_limits.borrow_and_update().clone();
 
-            if prev_limits != cfg.access.user_max_unique_ips
-                || prev_global_each != cfg.access.user_max_unique_ips_global_each
+            if previous.user_max_unique_ips != cfg.access.user_max_unique_ips
+                || previous.user_max_unique_ips_global_each
+                    != cfg.access.user_max_unique_ips_global_each
+                || previous.user_max_unique_ips_mode != cfg.access.user_max_unique_ips_mode
+                || previous.user_max_unique_ips_window_secs
+                    != cfg.access.user_max_unique_ips_window_secs
             {
-                ip_tracker_policy
-                    .load_limits(
+                let _ = ip_tracker_policy
+                    .apply_policy_from_source(
+                        generation_id,
                         cfg.access.user_max_unique_ips_global_each,
                         &cfg.access.user_max_unique_ips,
-                    )
-                    .await;
-                prev_limits = cfg.access.user_max_unique_ips.clone();
-                prev_global_each = cfg.access.user_max_unique_ips_global_each;
-            }
-
-            if prev_mode != cfg.access.user_max_unique_ips_mode
-                || prev_window != cfg.access.user_max_unique_ips_window_secs
-            {
-                ip_tracker_policy
-                    .set_limit_policy(
                         cfg.access.user_max_unique_ips_mode,
                         cfg.access.user_max_unique_ips_window_secs,
                     )
                     .await;
-                prev_mode = cfg.access.user_max_unique_ips_mode;
-                prev_window = cfg.access.user_max_unique_ips_window_secs;
+                previous = cfg.access.clone();
             }
         }
     });
 
     let limiter = shared_state.traffic_limiter.clone();
-    limiter.apply_policy(
-        config.access.user_rate_limits.clone(),
-        config.access.cidr_rate_limits.clone(),
-    );
     let mut config_rx_rate_limits = config_rx.clone();
     task_scope.spawn(async move {
         let mut prev_user_limits = config_rx_rate_limits
@@ -270,7 +249,8 @@ pub(crate) async fn spawn_runtime_tasks(
             if prev_user_limits != cfg.access.user_rate_limits
                 || prev_cidr_limits != cfg.access.cidr_rate_limits
             {
-                limiter.apply_policy(
+                let _ = limiter.apply_policy_from_source(
+                    generation_id,
                     cfg.access.user_rate_limits.clone(),
                     cfg.access.cidr_rate_limits.clone(),
                 );
@@ -288,8 +268,14 @@ pub(crate) async fn spawn_runtime_tasks(
                 break;
             }
             let cfg = config_rx_user_enabled.borrow_and_update().clone();
-            for user in shared_user_enabled.apply_user_enabled_config(&cfg.access.user_enabled) {
-                let cancelled = shared_user_enabled.cancel_user_sessions(&user);
+            let Some(cancelled_users) = shared_user_enabled.apply_user_config_from_source(
+                generation_id,
+                &cfg.access.users,
+                &cfg.access.user_enabled,
+            ) else {
+                continue;
+            };
+            for (user, cancelled) in cancelled_users {
                 if cancelled > 0 {
                     info!(
                         user = %user,
@@ -403,7 +389,10 @@ pub(crate) async fn spawn_metrics_if_configured(
     config: &Arc<ProxyConfig>,
     startup_tracker: &Arc<StartupTracker>,
     active_runtime: Arc<ArcSwap<RuntimeGeneration>>,
-) {
+    web_runtime_rx: tokio::sync::watch::Receiver<crate::web::control::WebRuntimePublication>,
+    tls_full_cert_budget: Arc<crate::tls_front::cache::TlsFullCertBudget>,
+    control_plane: ProcessControlPlane,
+) -> std::io::Result<()> {
     // metrics_listen takes precedence; fall back to metrics_port for backward compat.
     let metrics_target: Option<(u16, Option<String>)> =
         if let Some(ref listen) = config.server.metrics_listen {
@@ -411,12 +400,15 @@ pub(crate) async fn spawn_metrics_if_configured(
                 Ok(addr) => Some((addr.port(), Some(listen.clone()))),
                 Err(e) => {
                     startup_tracker
-                        .skip_component(
+                        .fail_component(
                             COMPONENT_METRICS_START,
                             Some(format!("invalid metrics_listen \"{}\": {}", listen, e)),
                         )
                         .await;
-                    None
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid metrics_listen \"{}\": {}", listen, e),
+                    ));
                 }
             }
         } else {
@@ -432,15 +424,30 @@ pub(crate) async fn spawn_metrics_if_configured(
                 Some(format!("spawn metrics endpoint on {}", label)),
             )
             .await;
-        let active_runtime = active_runtime.clone();
         let listen_backlog = config.server.listen_backlog;
-        tokio::spawn(async move {
-            metrics::serve(port, listen, listen_backlog, active_runtime).await;
-        });
+        let bound = match metrics::bind(port, listen, listen_backlog) {
+            Ok(bound) => bound,
+            Err(error) => {
+                startup_tracker
+                    .fail_component(
+                        COMPONENT_METRICS_START,
+                        Some(format!("metrics listener bind failed: {error}")),
+                    )
+                    .await;
+                return Err(error);
+            }
+        };
+        metrics::serve(
+            bound,
+            active_runtime,
+            web_runtime_rx,
+            tls_full_cert_budget,
+            control_plane,
+        );
         startup_tracker
             .complete_component(
                 COMPONENT_METRICS_START,
-                Some("metrics task spawned".to_string()),
+                Some("metrics listeners bound and supervised".to_string()),
             )
             .await;
     } else if config.server.metrics_listen.is_none() {
@@ -451,6 +458,7 @@ pub(crate) async fn spawn_metrics_if_configured(
             )
             .await;
     }
+    Ok(())
 }
 
 pub(crate) async fn mark_runtime_ready(startup_tracker: &Arc<StartupTracker>) {

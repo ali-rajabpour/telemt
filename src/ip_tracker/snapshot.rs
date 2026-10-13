@@ -21,7 +21,8 @@ impl UserIpTracker {
             return;
         }
 
-        let window = self.limit_window();
+        let policy = self.limit_policy.load();
+        let window = Self::limit_window(&policy);
         let now = Instant::now();
         for shard_lock in self.shards.iter() {
             let mut shard = shard_lock.write().await;
@@ -67,10 +68,13 @@ impl UserIpTracker {
         }
     }
 
-    pub async fn run_periodic_maintenance(self: Arc<Self>) {
+    pub async fn run_periodic_maintenance(self: Arc<Self>, source_generation: u64) {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         loop {
             interval.tick().await;
+            if self.limit_policy.load().source_generation != source_generation {
+                continue;
+            }
             self.drain_cleanup_queue().await;
             self.maybe_compact_empty_users().await;
         }
@@ -113,7 +117,8 @@ impl UserIpTracker {
         &self,
         users: &[String],
     ) -> HashMap<String, usize> {
-        let window = self.limit_window();
+        let policy = self.limit_policy.load();
+        let window = Self::limit_window(&policy);
         let now = Instant::now();
 
         let mut counts = HashMap::with_capacity(users.len());
@@ -152,7 +157,8 @@ impl UserIpTracker {
 
     pub async fn get_recent_ips_for_users(&self, users: &[String]) -> HashMap<String, Vec<IpAddr>> {
         self.drain_cleanup_queue().await;
-        let window = self.limit_window();
+        let policy = self.limit_policy.load();
+        let window = Self::limit_window(&policy);
         let now = Instant::now();
 
         let mut out = HashMap::with_capacity(users.len());
@@ -202,6 +208,7 @@ impl UserIpTracker {
     }
 
     pub(crate) async fn get_stats_snapshot(&self) -> Vec<(String, usize, usize)> {
+        let policy = self.limit_policy.load();
         let mut active_counts = Vec::new();
         for shard_lock in self.shards.iter() {
             let shard = shard_lock.read().await;
@@ -215,7 +222,7 @@ impl UserIpTracker {
 
         let mut stats = Vec::with_capacity(active_counts.len());
         for (username, active_count) in active_counts {
-            let limit = self.user_limit(&username).unwrap_or(0);
+            let limit = Self::user_limit(&policy, &username).unwrap_or(0);
             stats.push((username, active_count, limit));
         }
 
@@ -224,8 +231,25 @@ impl UserIpTracker {
     }
 
     pub async fn clear_user_ips(&self, username: &str) {
+        self.clear_user_ips_if_not_newer(username, 0).await;
+    }
+
+    /// Clears state while advancing the username fence to a newer incarnation.
+    pub(crate) async fn clear_user_ips_if_not_newer(
+        &self,
+        username: &str,
+        incarnation: UserIncarnation,
+    ) {
         let shard_idx = Self::shard_idx(username);
         let mut shard = self.shards[shard_idx].write().await;
+        if shard
+            .incarnations
+            .get(username)
+            .is_some_and(|current| *current > incarnation)
+        {
+            return;
+        }
+        shard.incarnations.insert(username.to_string(), incarnation);
         let removed_active_entries = shard
             .active_ips
             .remove(username)
@@ -242,23 +266,36 @@ impl UserIpTracker {
     }
 
     pub async fn clear_all(&self) {
+        let mut cleanup_drain_guards = Vec::with_capacity(USER_IP_TRACKER_SHARDS);
+        for drain_lock in self.cleanup_drain_locks.iter() {
+            cleanup_drain_guards.push(drain_lock.lock().await);
+        }
         for shard_lock in self.shards.iter() {
             let mut shard = shard_lock.write().await;
             shard.active_ips.clear();
             shard.recent_ips.clear();
+            shard.incarnations.clear();
         }
         self.active_entry_count.store(0, Ordering::Relaxed);
         self.recent_entry_count.store(0, Ordering::Relaxed);
+        let mut cleanup_queue_guards = Vec::with_capacity(USER_IP_TRACKER_SHARDS);
         for cleanup_shard in self.cleanup_shards.iter() {
-            match cleanup_shard.queue.lock() {
-                Ok(mut queue) => queue.clear(),
+            let queue = match cleanup_shard.queue.lock() {
+                Ok(queue) => queue,
                 Err(poisoned) => {
-                    poisoned.into_inner().clear();
+                    let queue = poisoned.into_inner();
                     cleanup_shard.queue.clear_poison();
+                    queue
                 }
-            }
+            };
+            cleanup_queue_guards.push(queue);
+        }
+        for queue in cleanup_queue_guards.iter_mut() {
+            queue.clear();
         }
         self.cleanup_queue_len.store(0, Ordering::Relaxed);
+        drop(cleanup_queue_guards);
+        drop(cleanup_drain_guards);
     }
 
     pub async fn is_ip_active(&self, username: &str, ip: IpAddr) -> bool {
@@ -273,7 +310,8 @@ impl UserIpTracker {
     }
 
     pub async fn get_user_limit(&self, username: &str) -> Option<usize> {
-        self.user_limit(username)
+        let policy = self.limit_policy.load();
+        Self::user_limit(&policy, username)
     }
 
     pub async fn format_stats(&self) -> String {

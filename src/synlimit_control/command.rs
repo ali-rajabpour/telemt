@@ -1,38 +1,45 @@
-use std::path::PathBuf;
-
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+
+use crate::util::trusted_command::trusted_helper_command;
+
+const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub(super) async fn run_command(
     binary: &str,
     args: &[&str],
     stdin: Option<String>,
 ) -> Result<(), String> {
-    let Some(command_path) = resolve_command(binary) else {
+    let Some(command) = trusted_helper_command(binary) else {
         return Err(format!("{binary} is not available"));
     };
-    let mut command = Command::new(command_path);
+    let mut command = Command::from(command);
     command.args(args);
     if stdin.is_some() {
         command.stdin(std::process::Stdio::piped());
     }
     command.stdout(std::process::Stdio::null());
     command.stderr(std::process::Stdio::piped());
+    command.kill_on_drop(true);
     let mut child = command
         .spawn()
         .map_err(|e| format!("spawn {binary} failed: {e}"))?;
-    if let Some(blob) = stdin
-        && let Some(mut writer) = child.stdin.take()
-    {
-        writer
-            .write_all(blob.as_bytes())
+    let output = tokio::time::timeout(COMMAND_TIMEOUT, async move {
+        if let Some(blob) = stdin
+            && let Some(mut writer) = child.stdin.take()
+        {
+            writer
+                .write_all(blob.as_bytes())
+                .await
+                .map_err(|e| format!("stdin write {binary} failed: {e}"))?;
+        }
+        child
+            .wait_with_output()
             .await
-            .map_err(|e| format!("stdin write {binary} failed: {e}"))?;
-    }
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|e| format!("wait {binary} failed: {e}"))?;
+            .map_err(|e| format!("wait {binary} failed: {e}"))
+    })
+    .await
+    .map_err(|_| format!("{binary} timed out after {}s", COMMAND_TIMEOUT.as_secs()))??;
     if output.status.success() {
         return Ok(());
     }
@@ -45,13 +52,14 @@ pub(super) async fn run_command(
 }
 
 pub(super) async fn run_command_stdout(binary: &str, args: &[&str]) -> Result<String, String> {
-    let Some(command_path) = resolve_command(binary) else {
+    let Some(command) = trusted_helper_command(binary) else {
         return Err(format!("{binary} is not available"));
     };
-    let output = Command::new(command_path)
-        .args(args)
-        .output()
+    let mut command = Command::from(command);
+    command.args(args).kill_on_drop(true);
+    let output = tokio::time::timeout(COMMAND_TIMEOUT, command.output())
         .await
+        .map_err(|_| format!("{binary} timed out after {}s", COMMAND_TIMEOUT.as_secs()))?
         .map_err(|e| format!("wait {binary} failed: {e}"))?;
     if output.status.success() {
         return Ok(String::from_utf8_lossy(&output.stdout).to_string());
@@ -64,17 +72,7 @@ pub(super) async fn run_command_stdout(binary: &str, args: &[&str]) -> Result<St
     })
 }
 
-fn resolve_command(binary: &str) -> Option<PathBuf> {
-    let mut dirs = std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
-        .unwrap_or_default();
-    dirs.extend(["/usr/sbin", "/sbin", "/usr/bin", "/bin"].map(PathBuf::from));
-    dirs.into_iter()
-        .map(|dir| dir.join(binary))
-        .find(|candidate| candidate.exists() && candidate.is_file())
-}
-
-pub(super) fn has_cap_net_admin() -> bool {
+pub(super) fn has_firewall_privileges() -> bool {
     #[cfg(target_os = "linux")]
     {
         let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
@@ -91,7 +89,11 @@ pub(super) fn has_cap_net_admin() -> bool {
         }
         false
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        nix::unistd::Uid::effective().is_root()
+    }
+    #[cfg(not(unix))]
     {
         false
     }

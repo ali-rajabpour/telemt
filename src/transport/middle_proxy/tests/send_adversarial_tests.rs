@@ -15,6 +15,10 @@ use crate::network::probe::NetworkDecision;
 use crate::stats::Stats;
 
 async fn make_pool() -> (Arc<MePool>, Arc<SecureRandom>) {
+    make_pool_with_decision(NetworkDecision::default()).await
+}
+
+async fn make_pool_with_decision(decision: NetworkDecision) -> (Arc<MePool>, Arc<SecureRandom>) {
     let general = GeneralConfig {
         me_route_no_writer_mode: MeRouteNoWriterMode::AsyncRecoveryFailfast,
         me_route_no_writer_wait_ms: 50,
@@ -40,7 +44,7 @@ async fn make_pool() -> (Arc<MePool>, Arc<SecureRandom>) {
         HashMap::new(),
         HashMap::new(),
         None,
-        NetworkDecision::default(),
+        decision,
         None,
         rng.clone(),
         Arc::new(Stats::default()),
@@ -115,6 +119,7 @@ async fn make_pool() -> (Arc<MePool>, Arc<SecureRandom>) {
         general.me_route_blocking_send_timeout_ms,
         general.me_route_inline_recovery_attempts,
         general.me_route_inline_recovery_wait_ms,
+        16_384,
     );
 
     (pool, rng)
@@ -149,13 +154,11 @@ async fn insert_writer(
     };
 
     pool.writers.write().await.push(writer);
-    {
-        let mut map = pool.proxy_map_v4.write().await;
-        map.entry(writer_dc)
-            .or_insert_with(Vec::new)
-            .push((addr.ip(), addr.port()));
-    }
-    pool.rebuild_endpoint_dc_map().await;
+    let mut map = pool.endpoint_snapshot.load().map_v4.clone();
+    map.entry(writer_dc)
+        .or_insert_with(Vec::new)
+        .push((addr.ip(), addr.port()));
+    pool.update_proxy_maps(map, None).await;
     if register_in_registry {
         pool.registry
             .register_writer(writer_id, tx, byte_budget)
@@ -214,6 +217,54 @@ fn proxy_req_our_addr_from_payload(payload: &[u8]) -> SocketAddr {
 }
 
 #[tokio::test]
+async fn send_proxy_req_uses_live_same_dc_writer_while_preferred_endpoint_refills() {
+    let decision = NetworkDecision {
+        ipv4_dc: true,
+        ipv4_me: true,
+        effective_prefer: 4,
+        ..NetworkDecision::default()
+    };
+    let (pool, _rng) = make_pool_with_decision(decision).await;
+    let old_positive_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 3, 2)), 443);
+    let old_negative_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 3, 3)), 443);
+    let mut old_positive_rx = insert_writer(&pool, 41, 2, old_positive_addr, true).await;
+    let _old_negative_rx = insert_writer(&pool, 42, -2, old_negative_addr, true).await;
+
+    let new_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 42)), 443);
+    pool.update_proxy_maps(
+        HashMap::from([(2, vec![(new_addr.ip(), new_addr.port())])]),
+        None,
+    )
+    .await;
+
+    assert!(pool.admission_ready_conditional_cast().await);
+    assert_eq!(pool.preferred_endpoints_for_dc(2).await, vec![new_addr]);
+
+    let (conn_id, _rx) = pool.registry.register().await;
+    let result = pool
+        .send_proxy_req(
+            conn_id,
+            2,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30004),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443),
+            b"cold-route",
+            0,
+            None,
+            None,
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "a live same-DC writer must bridge preferred-endpoint refill: {result:?}"
+    );
+    assert_eq!(
+        recv_data_count(&mut old_positive_rx, Duration::from_millis(50)).await,
+        1
+    );
+}
+
+#[tokio::test]
 async fn send_proxy_req_does_not_replay_when_first_bind_commit_fails() {
     let (pool, _rng) = make_pool().await;
     pool.rr.store(0, Ordering::Relaxed);
@@ -262,6 +313,36 @@ async fn send_proxy_req_does_not_replay_when_first_bind_commit_fails() {
     let bound = pool.registry.get_writer(conn_id).await;
     assert!(bound.is_some());
     assert_eq!(bound.expect("writer should be bound").writer_id, 11);
+}
+
+#[tokio::test]
+async fn missing_client_route_does_not_prune_a_healthy_writer() {
+    let (pool, _rng) = make_pool().await;
+    let writer_id = 12;
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 12)), 443);
+    let _writer_rx = insert_writer(&pool, writer_id, 2, addr, true).await;
+
+    let result = pool
+        .send_proxy_req(
+            999_999,
+            2,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30005),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443),
+            b"cancelled-route",
+            0,
+            None,
+            None,
+        )
+        .await;
+
+    assert!(result.is_err());
+    assert!(
+        pool.writers
+            .read()
+            .await
+            .iter()
+            .any(|writer| writer.id == writer_id)
+    );
 }
 
 #[tokio::test]
