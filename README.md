@@ -42,6 +42,9 @@ untouched; every other SNI keeps going to your websites.
    ```
    If `PUBLIC_HOST` is a domain on Cloudflare, its DNS record must be **DNS only** (grey
    cloud). Cloudflare's proxy only carries HTTP and would break the connection.
+   Any `config.toml` key can be set this way as `TELEMT_<SECTION>__<KEY>` (nested sections
+   joined with `__`); env values override the file. `config.toml` ships with no users, so
+   at least one `TELEMT_ACCESS__USERS__<NAME>` is required.
 3. Deploy. Nothing needs to be configured in Traefik; the compose labels add the route.
 4. Get the share link from the container log:
    ```bash
