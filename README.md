@@ -27,6 +27,36 @@ curl -fsSL https://raw.githubusercontent.com/telemt/telemt/main/install.sh | sh
 - [Quick Start Guide](docs/Quick_start/QUICK_START_GUIDE.en.md)
 - [Инструкция по быстрому запуску](docs/Quick_start/QUICK_START_GUIDE.ru.md)
 
+### Deploying on Dokploy (shares port 443 with your websites)
+`docker-compose-dokploy.yml` runs telemt behind Dokploy's Traefik on port 443. No extra
+port is opened. Traefik reads the TLS SNI of each connection: if it equals your fake
+domain (`TELEMT_CENSORSHIP__TLS_DOMAIN`), the connection is passed through to telemt
+untouched; every other SNI keeps going to your websites.
+
+1. In Dokploy, create a **Compose** service from this repo, compose path
+   `./docker-compose-dokploy.yml`.
+2. In its **Environment** tab set (see [.env.example](.env.example), section 6):
+   ```env
+   TELEMT_GENERAL__LINKS__PUBLIC_HOST=proxy.example.com   # your domain or server IP
+   TELEMT_GENERAL__LINKS__PUBLIC_PORT=443
+   TELEMT_CENSORSHIP__TLS_DOMAIN=petrovich.ru             # fake domain, never one you host here
+   TELEMT_ACCESS__USERS__ALICE=<openssl rand -hex 16>
+   ```
+   If `PUBLIC_HOST` is a domain on Cloudflare, its DNS record must be **DNS only** (grey
+   cloud). Cloudflare's proxy only carries HTTP and would break the connection.
+3. Deploy. Nothing needs to be configured in Traefik; the compose labels add the route.
+4. Get the share link from the container log:
+   ```bash
+   docker logs $(docker ps -qf name=telemt) 2>&1 | grep -o 'tg://proxy[^ ]*' | tail -1
+   ```
+   It looks like `tg://proxy?server=proxy.example.com&port=443&secret=ee…`. Open it on a
+   device with Telegram, or send it to your users.
+
+Changing `TLS_DOMAIN`, a user secret, or `PUBLIC_HOST`/`PUBLIC_PORT` changes the link, so
+send the new one to your users. Telemt sees real client IPs only if Traefik receives them,
+which requires Traefik's port 443 to be published in `host` mode. Swarm's default
+`ingress` mode hides them.
+
 ## Features
 Our implementation of **TLS-fronting** is one of the most deeply debugged, focused, advanced and *almost* **"behaviorally consistent to real"**:  we are confident we have it right - [see evidence on our validation and traces](docs/FAQ.en.md#recognizability-for-dpi-and-crawler)
 

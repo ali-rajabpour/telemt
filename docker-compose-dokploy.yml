@@ -1,18 +1,24 @@
 # Dokploy-ready compose file.
 #
-# MTProto is not HTTP, so Traefik (HTTP reverse proxy) cannot route it.
-# Dokploy's Traefik is configured with HTTP TLS termination on port 443,
-# which conflicts with MTProto's TLS passthrough requirement.
+# Port 443 is shared with Dokploy's Traefik. No host port is published.
 #
-# Solution: publish a dedicated port (8443) directly from the container,
-# bypassing Traefik entirely for MTProto traffic. Port 443 stays with
-# Traefik for other HTTP services on the server.
+# Fake-TLS clients send the fake domain (TELEMT_CENSORSHIP__TLS_DOMAIN) as
+# the TLS SNI. A Traefik TCP router matches that SNI and passes the raw
+# connection through to telemt without terminating TLS. Every other SNI keeps
+# going to the HTTP services on the same port, so nothing else changes.
 #
-# Set TELEMT_GENERAL__LINKS__PUBLIC_PORT=8443 in your Dokploy env vars
-# so generated share links use the correct public port.
+#   client --443--> Traefik --SNI = TLS_DOMAIN, passthrough--> telemt:443
+#                           \--any other SNI------------------> web apps
+#
+# Traefik prepends a PROXY protocol v2 header so telemt sees the client
+# address instead of Traefik's. Both ends are set below and must stay in sync:
+# the label adds the header, TELEMT_SERVER__PROXY_PROTOCOL=true parses it.
+#
+# Required Dokploy env: TELEMT_GENERAL__LINKS__PUBLIC_PORT=443 so share links
+# point at 443. TLS_DOMAIN must never be a domain served by this Traefik,
+# or that site's traffic would be sent to telemt.
 #
 # Metrics and API endpoints remain internal (expose only, no public ports).
-# To access them, use `docker exec` or uncomment the ports below.
 #
 # All env vars are documented in .env.example. Set them in the Dokploy UI
 # environment section, not in this file.
@@ -24,9 +30,18 @@ services:
       context: .
       target: prod
     restart: unless-stopped
-    ports:
-      - "${PROXY_PUBLIC_PORT:-8443}:443"
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=dokploy-network
+      - traefik.tcp.routers.telemt.entrypoints=websecure
+      - traefik.tcp.routers.telemt.rule=HostSNI(`${TELEMT_CENSORSHIP__TLS_DOMAIN:-petrovich.ru}`)
+      - traefik.tcp.routers.telemt.tls.passthrough=true
+      - traefik.tcp.routers.telemt.service=telemt
+      - traefik.tcp.services.telemt.loadbalancer.server.port=443
+      # Traefik v2 syntax. On Traefik v3 this moves to a serversTransport.
+      - traefik.tcp.services.telemt.loadbalancer.proxyprotocol.version=2
     expose:
+      - "443"
       - "9090"
       - "9091"
     working_dir: /run/telemt
@@ -41,6 +56,8 @@ services:
       - .env
     environment:
       - RUST_LOG=${RUST_LOG:-info}
+      # Pairs with the proxyprotocol label above; one without the other breaks every connection.
+      - TELEMT_SERVER__PROXY_PROTOCOL=true
     healthcheck:
       test: [ "CMD", "/app/telemt", "healthcheck", "/app/config.toml", "--mode", "liveness" ]
       interval: 30s
